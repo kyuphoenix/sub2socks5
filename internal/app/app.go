@@ -26,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type App struct {
@@ -1092,22 +1094,74 @@ func (a *App) serveRotateGatewayListener(gw *rotateGateway, ln net.Listener, gro
 
 func (a *App) handleRotateGatewayConn(client net.Conn, groupTag string, internalPort int) {
 	defer client.Close()
+	selectedTag := ""
 	a.mu.Lock()
-	steps := a.rotateGroupsStepLocked(time.Now(), groupTag)
-	if len(steps) == 0 {
-		_ = switchClashSelector(groupTag, groupTag)
-	}
+	selectedTag = a.rotateGroupStepFastLocked(time.Now(), groupTag)
 	a.mu.Unlock()
+	if selectedTag != "" {
+		msg := fmt.Sprintf("[rotate-gateway] group=%s selected=%s upstream=127.0.0.1:%d", groupTag, selectedTag, internalPort)
+		fmt.Println(msg)
+		a.appendRuntimeLog(msg)
+		_ = switchClashSelector(groupTag, selectedTag)
+	}
 	upstream, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", internalPort), 8*time.Second)
 	if err != nil {
 		a.appendRuntimeLog("rotate gateway dial upstream failed: " + err.Error())
 		return
 	}
 	defer upstream.Close()
+	_ = client.SetDeadline(time.Now().Add(120 * time.Second))
+	_ = upstream.SetDeadline(time.Now().Add(120 * time.Second))
 	done := make(chan struct{}, 2)
 	go func() { _, _ = io.Copy(upstream, client); done <- struct{}{} }()
 	go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
 	<-done
+}
+
+func (a *App) rotateGroupStepFastLocked(now time.Time, requestedTag string) string {
+	groups := getSlice(getMap(a.cfg, "nodeRegistry"), "groups")
+	if len(groups) == 0 {
+		return ""
+	}
+	runtimeState := getMap(a.cfg, "runtimeState")
+	if runtimeState == nil {
+		runtimeState = map[string]any{}
+		a.cfg["runtimeState"] = runtimeState
+	}
+	rotateStates := getMap(runtimeState, "rotateGroups")
+	if rotateStates == nil {
+		rotateStates = map[string]any{}
+		runtimeState["rotateGroups"] = rotateStates
+	}
+	for _, g := range groups {
+		gm, ok := g.(map[string]any)
+		if !ok || strings.TrimSpace(mustStr(gm["strategy"])) != "rotate" {
+			continue
+		}
+		tag := strings.TrimSpace(mustStr(gm["tag"]))
+		if tag == "" || (requestedTag != "" && requestedTag != tag) {
+			continue
+		}
+		members := normalizeGroupMembers(gm)
+		if len(members) == 0 {
+			continue
+		}
+		state := ensureRotateState(rotateStates, tag, members)
+		current := rotateStateCurrent(state, members)
+		if current == "" {
+			current = members[0]
+		}
+		nextIndex := (rotateStateIndexOf(current, members) + 1) % len(members)
+		next := members[nextIndex]
+		state["current"] = next
+		state["index"] = nextIndex
+		state["updatedAt"] = now.Format(time.RFC3339)
+		state["lastSwitch"] = now.Format(time.RFC3339)
+		state["queue"] = append([]string{}, members...)
+		rotateStates[tag] = state
+		return next
+	}
+	return ""
 }
 
 func (a *App) stopRotateGatewayLocked() {
@@ -2132,7 +2186,232 @@ func parseSubscription(raw string) parseResult {
 		}
 		out.nodes = append(out.nodes, node)
 	}
+	if len(out.nodes) == 0 {
+		yamlNodes, yamlWarnings := parseClashYAMLSubscription(txt)
+		out.nodes = append(out.nodes, yamlNodes...)
+		out.warnings = append(out.warnings, yamlWarnings...)
+	}
 	return out
+}
+
+func parseClashYAMLSubscription(raw string) ([]map[string]any, []string) {
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(raw), &doc); err != nil {
+		return nil, nil
+	}
+	proxies, ok := doc["proxies"].([]any)
+	if !ok || len(proxies) == 0 {
+		return nil, nil
+	}
+	nodes := make([]map[string]any, 0, len(proxies))
+	warnings := []string{}
+	for _, item := range proxies {
+		pm, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		node, err := parseClashProxy(pm)
+		if err != nil {
+			warnings = append(warnings, "Clash YAML 节点解析失败: "+err.Error())
+			continue
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, warnings
+}
+
+func parseClashProxy(pm map[string]any) (map[string]any, error) {
+	pType := strings.ToLower(strings.TrimSpace(mustStr(pm["type"])))
+	tag := strings.TrimSpace(firstNonEmpty(mustStr(pm["name"]), mustStr(pm["tag"])))
+	server := strings.TrimSpace(mustStr(pm["server"]))
+	port := int(toFloat(pm["port"]))
+	if tag == "" {
+		tag = firstNonEmpty(server, "clash-node")
+	}
+	switch pType {
+	case "ss":
+		return map[string]any{"type": "shadowsocks", "tag": tag, "server": server, "server_port": port, "method": mustStr(pm["cipher"]), "password": mustStr(pm["password"])}, nil
+	case "trojan":
+		return map[string]any{"type": "trojan", "tag": tag, "server": server, "server_port": port, "password": mustStr(pm["password"]), "tls": map[string]any{"enabled": true, "server_name": firstNonEmpty(mustStr(pm["sni"]), server), "insecure": boolFromAny(pm["skip-cert-verify"])}}, nil
+	case "vmess":
+		node := map[string]any{"type": "vmess", "tag": tag, "server": server, "server_port": port, "uuid": mustStr(pm["uuid"]), "alter_id": int(toFloat(pm["alterId"])), "security": firstNonEmpty(mustStr(pm["cipher"]), "auto")}
+		return node, nil
+	case "vless":
+		node := map[string]any{"type": "vless", "tag": tag, "server": server, "server_port": port, "uuid": mustStr(pm["uuid"])}
+		if flow := strings.TrimSpace(mustStr(pm["flow"])); flow != "" {
+			node["flow"] = flow
+		}
+		node["tls"] = map[string]any{"enabled": true, "server_name": firstNonEmpty(mustStr(pm["servername"]), mustStr(pm["sni"]), server), "insecure": boolFromAny(pm["skip-cert-verify"])}
+		return node, nil
+	case "tuic":
+		tls := map[string]any{
+			"enabled":     true,
+			"server_name": firstNonEmpty(mustStr(pm["servername"]), mustStr(pm["sni"]), server),
+			"insecure":    boolFromAny(pm["skip-cert-verify"]),
+		}
+		if alpn := strings.TrimSpace(mustStr(pm["alpn"])); alpn != "" {
+			tls["alpn"] = splitCSV(alpn)
+		} else {
+			tls["alpn"] = []any{"h3"}
+		}
+		node := map[string]any{
+			"type":               "tuic",
+			"tag":                tag,
+			"server":             server,
+			"server_port":        port,
+			"uuid":               firstNonEmpty(mustStr(pm["uuid"]), mustStr(pm["id"])),
+			"password":           firstNonEmpty(mustStr(pm["password"]), mustStr(pm["token"])),
+			"congestion_control": firstNonEmpty(mustStr(pm["congestion-controller"]), mustStr(pm["congestion_control"]), "bbr"),
+			"tls":                tls,
+		}
+		return node, nil
+	case "hysteria2", "hy2":
+		tls := map[string]any{
+			"enabled":     true,
+			"server_name": firstNonEmpty(mustStr(pm["servername"]), mustStr(pm["sni"]), server),
+			"insecure":    boolFromAny(pm["skip-cert-verify"]),
+		}
+		if alpn := strings.TrimSpace(mustStr(pm["alpn"])); alpn != "" {
+			tls["alpn"] = splitCSV(alpn)
+		}
+		node := map[string]any{
+			"type":        "hysteria2",
+			"tag":         tag,
+			"server":      server,
+			"server_port": port,
+			"password":    firstNonEmpty(mustStr(pm["password"]), mustStr(pm["auth"]), mustStr(pm["auth-str"]), mustStr(pm["token"])),
+			"tls":         tls,
+		}
+		if up := strings.TrimSpace(firstNonEmpty(mustStr(pm["up"]), mustStr(pm["up_mbps"]), mustStr(pm["upmbps"]))); up != "" {
+			node["up_mbps"] = parseRateMbps(up)
+		}
+		if down := strings.TrimSpace(firstNonEmpty(mustStr(pm["down"]), mustStr(pm["down_mbps"]), mustStr(pm["downmbps"]))); down != "" {
+			node["down_mbps"] = parseRateMbps(down)
+		}
+		if obfs := strings.TrimSpace(mustStr(pm["obfs"])); obfs != "" {
+			node["obfs"] = map[string]any{
+				"type":     obfs,
+				"password": firstNonEmpty(mustStr(pm["obfs-password"]), mustStr(pm["obfs_password"])),
+			}
+		}
+		return node, nil
+	case "anytls":
+		tls := map[string]any{
+			"enabled":     true,
+			"server_name": firstNonEmpty(mustStr(pm["servername"]), mustStr(pm["sni"]), server),
+			"insecure":    boolFromAny(pm["skip-cert-verify"]),
+		}
+		node := map[string]any{
+			"type":        "anytls",
+			"tag":         tag,
+			"server":      server,
+			"server_port": port,
+			"password":    firstNonEmpty(mustStr(pm["password"]), mustStr(pm["id"]), mustStr(pm["uuid"])),
+			"tls":         tls,
+		}
+		return node, nil
+	case "http":
+		return map[string]any{
+			"type":        "http",
+			"tag":         tag,
+			"server":      server,
+			"server_port": firstInt(port, 80),
+			"username":    mustStr(pm["username"]),
+			"password":    mustStr(pm["password"]),
+		}, nil
+	case "ssr":
+		return map[string]any{
+			"type":        "shadowsocks",
+			"tag":         tag,
+			"server":      server,
+			"server_port": port,
+			"method":      firstNonEmpty(mustStr(pm["cipher"]), mustStr(pm["method"])),
+			"password":    mustStr(pm["password"]),
+		}, nil
+	case "snell":
+		return map[string]any{
+			"type":        "snell",
+			"tag":         tag,
+			"server":      server,
+			"server_port": port,
+			"psk":         firstNonEmpty(mustStr(pm["psk"]), mustStr(pm["password"])),
+			"version":     mustAtoiDefault(mustStr(pm["version"]), 3),
+		}, nil
+	case "wireguard":
+		return map[string]any{
+			"type":           "wireguard",
+			"tag":            tag,
+			"server":         server,
+			"server_port":    port,
+			"private_key":    mustStr(pm["private-key"]),
+			"peer_public_key": firstNonEmpty(mustStr(pm["public-key"]), mustStr(pm["peer-public-key"])),
+		}, nil
+	case "socks5", "socks":
+		return map[string]any{"type": "socks", "tag": tag, "server": server, "server_port": firstInt(port, 1080), "username": mustStr(pm["username"]), "password": mustStr(pm["password"])}, nil
+	default:
+		fallbackTag := tag
+		if !strings.HasPrefix(strings.ToLower(fallbackTag), "[fallback]") {
+			fallbackTag = "[fallback] " + fallbackTag
+		}
+		if server == "" || port <= 0 {
+			return nil, fmt.Errorf("不支持的 Clash 类型: %s", pType)
+		}
+		if user := strings.TrimSpace(mustStr(pm["username"])); user != "" {
+			return map[string]any{
+				"type":               "http",
+				"tag":                fallbackTag,
+				"server":             server,
+				"server_port":        firstInt(port, 80),
+				"username":           user,
+				"password":           mustStr(pm["password"]),
+				"compat_fallback":    true,
+				"compat_origin_type": pType,
+			}, nil
+		}
+		if method := strings.TrimSpace(firstNonEmpty(mustStr(pm["cipher"]), mustStr(pm["method"]))); method != "" {
+			return map[string]any{
+				"type":               "shadowsocks",
+				"tag":                fallbackTag,
+				"server":             server,
+				"server_port":        port,
+				"method":             method,
+				"password":           mustStr(pm["password"]),
+				"compat_fallback":    true,
+				"compat_origin_type": pType,
+			}, nil
+		}
+		return map[string]any{
+			"type":               "socks",
+			"tag":                fallbackTag,
+			"server":             server,
+			"server_port":        firstInt(port, 1080),
+			"username":           mustStr(pm["username"]),
+			"password":           mustStr(pm["password"]),
+			"compat_fallback":    true,
+			"compat_origin_type": pType,
+		}, nil
+	}
+}
+
+func boolFromAny(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		s := strings.TrimSpace(strings.ToLower(t))
+		return s == "1" || s == "true" || s == "yes" || s == "on"
+	case float64:
+		return t != 0
+	default:
+		return false
+	}
+}
+
+func firstInt(value int, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
 }
 
 func parseManualNodeInput(raw string) map[string]any {
