@@ -765,10 +765,10 @@ async function autoConfigureSocksServicesFromOutbounds() {
     ? latestData.config.nodeRegistry.groups.slice()
     : [];
   const generatedGroups = [];
-  const rotateGroupTag = 'ALL-PASSED-ROTATE';
+  const urltestGroupTag = 'ALL-PASSED-URLTEST';
   generatedGroups.push({
-    tag: rotateGroupTag,
-    strategy: 'rotate',
+    tag: urltestGroupTag,
+    strategy: 'urltest',
     url: 'https://www.gstatic.com/generate_204',
     interval: '10m',
     timeoutMs: 5000,
@@ -801,7 +801,7 @@ async function autoConfigureSocksServicesFromOutbounds() {
   const generated = [];
 
   const targetsForServices = [
-    { tag: rotateGroupTag, isGroup: true },
+    { tag: urltestGroupTag, isGroup: true },
     ...generatedGroups.map((group) => ({ tag: group.tag, isGroup: true })),
     ...passedOutbounds.filter((item) => !groupedNodeTags.has(item.tag)).map((item) => ({ tag: item.tag, isGroup: false }))
   ];

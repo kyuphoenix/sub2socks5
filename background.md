@@ -1,702 +1,199 @@
-# sing-box Background
+# Background（开发背景与实现说明）
 
-本文件用于记录当前阶段项目实际使用到的技术、参考材料、配置思路、实现映射和测试结论，方便后续继续开发时快速接手。
-
----
-
-## 1. 当前使用到的技术
-
-### 1.1 后端技术
-
-- `Go 1.23+`
-  - 作为项目主运行时
-  - 用于提供本地 HTTP 服务、配置管理、订阅拉取、内核管理和进程控制
-
-- Go 标准库（当前核心）
-  - `net/http`
-    - 提供 Web UI 与 API
-  - `os` / `path/filepath`
-    - 读写配置、管理跨目录路径
-  - `encoding/json`
-    - 配置、订阅状态和运行数据序列化
-  - `net/url`
-    - 节点 URI 解析
-  - `os/exec`
-    - 启动与管理 `sing-box`
-  - `embed` / `io/fs`
-    - 将静态前端资源打包进二进制
-
-### 1.2 前端技术
-
-- 原生 HTML / CSS / JavaScript
-  - 当前没有引入前端框架
-  - 使用静态页面 + 原生 DOM 事件实现 Web UI
-
-- 前端交互方式
-  - `fetch` 调用后端 API
-  - `localStorage`
-    - 用于节点管理页和主页之间的联动通知
-  - 轮询刷新
-    - 用于主页状态、运行日志、下载状态同步
-
-### 1.3 代理内核技术
-
-- `sing-box`
-  - 作为核心代理引擎
-  - 负责：
-    - 启动 `SOCKS5` 入站
-    - 节点连接
-    - 出站转发
-    - DNS 解析
-    - 规则路由
-
-### 1.4 配置与运行相关技术
-
-- JSON 配置持久化
-  - 项目业务配置保存在 `data\app-config.json`
-  - 订阅状态保存在 `data\subscription-state.json`
-  - 运行配置保存在 `runtime\sing-box.json`
-
-- GitHub Releases
-  - 用于下载匹配架构的 `sing-box` 内核
-
-- PowerShell
-  - 用于 Windows 环境下测试端口监听、启动内核、验证代理是否可用
+本文档记录 `sub2socks5` 当前实现、关键设计取舍、兼容策略与验证方法，便于后续继续开发。
 
 ---
 
-## 2. 当前参考材料
+## 1. 技术栈
 
-当前实现主要参考以下资料：
+### 后端
 
-- `sing-box` 官方中文配置文档
-  - `https://sing-box.sagernet.org/zh/configuration/`
+- 语言：`Go 1.23+`
+- 主要标准库：
+  - `net/http`：Web UI 与 API 服务。
+  - `os`、`filepath`：目录、配置与运行时文件管理。
+  - `encoding/json`：配置与状态序列化。
+  - `os/exec`：sing-box 进程管理。
+  - `net`：端口探测与监听冲突规避。
+- 第三方库：
+  - `gopkg.in/yaml.v3`：Clash/Mihomo YAML 解析。
 
-- `sing-box` 官方 GitHub 仓库
-  - `https://github.com/SagerNet/sing-box`
+### 前端
 
-- `sing-box` Release 页面
-  - 用于版本列表同步和内核下载
-  - `https://github.com/SagerNet/sing-box/releases`
+- 原生 `HTML + CSS + JavaScript`。
+- 通过 `fetch` 调用后端 API。
+- 表单视图与 JSON 视图可切换。
+- 运行状态页包含状态与日志选项卡。
 
-- `v2rayN` 仓库
-  - 用于参考节点解析兼容思路
-  - `https://github.com/2dust/v2rayN`
+### 代理内核
 
-说明：
-- 项目实现不是直接复制官方文档，而是根据官方文档结构做工程化映射。
-- 某些协议字段、URI 兼容逻辑、DNS 生成方式是在工程调试中逐步修正的。
-
----
-
-## 3. 当前项目真实架构
-
-项目当前采用：
-
-**`Go 管理层 + sing-box 内核层 + 静态 Web UI 层`**
-
-### 3.1 管理层
-
-由 `Go` 提供：
-
-- 配置读写
-- 订阅拉取与解析
-- 节点和节点组管理
-- 版本列表管理
-- 内核下载管理
-- `sing-box` 配置生成
-- `sing-box` 进程启动 / 停止
-- 运行状态与日志 API
-
-### 3.2 内核层
-
-由 `sing-box` 提供：
-
-- `SOCKS5` 入站监听
-- 代理流量转发
-- DNS 查询
-- 路由与出站选择
-- 节点连接与传输层处理
-
-### 3.3 Web UI 层
-
-由静态前端页面提供：
-
-- 基础配置编辑
-- 节点管理
-- 内核检测与下载
-- 运行状态查看
-- 实时日志查看
-- 表单 / JSON 双模式切换
+- `sing-box` 负责出站协议、DNS、路由、入站 SOCKS5 监听与原生分组策略。
 
 ---
 
-## 4. 当前代码模块映射
+## 2. 目录与持久化
 
-### `D:\sub2socks5\main.go`
+源码运行时以项目目录为根目录，打包后二进制以自身所在目录为根目录。
 
-职责：
-- 程序入口
-- 注入 `internal/public` 静态资源并启动服务
+- `internal/data/app-config.json`：主配置。
+- `internal/data/subscription-state.json`：订阅原文、解析节点、警告信息。
+- `internal/data/release-list.json`：sing-box Release 列表缓存。
+- `internal/runtime/sing-box.json`：生成的 sing-box 配置。
+- `internal/bin/`：下载的 sing-box 内核。
 
-### `D:\sub2socks5\internal\app\app.go`
-
-职责：
-- HTTP 服务入口
-- API 路由分发
-- 提供静态页面
-
-当前主要接口：
-- `/api/config`
-- `/api/subscription/refresh`
-- `/api/nodes`
-- `/api/kernel/*`
-- `/api/runtime/*`
-
-### `D:\sub2socks5\internal\public\app.js`
-
-职责：
-- 主页交互逻辑
-- 表单模式和 JSON 模式切换
-- 保存配置
-- 更新订阅
-- 生成配置
-- 启动 / 停止 `sing-box`
-- 架构检测、版本检测、版本更新、计划版本选择、内核下载
-- 日志和状态刷新
-
-### `D:\sub2socks5\internal\public\nodes.js`
-
-职责：
-- 节点管理页逻辑
-- 添加手动节点
-- 添加节点组
-- 节点组成员选择
-- 保存节点配置
-- 通过 `localStorage` 通知主页刷新可选出口
+启动时会自动创建缺失目录与默认配置，避免首次运行因文件不存在失败。
 
 ---
 
-## 5. 当前使用到的 sing-box 配置概念
+## 3. 模块划分
 
-当前项目实际生成和使用的 `sing-box` 顶层配置有：
-
-- `log`
-- `dns`
-- `inbounds`
-- `outbounds`
-- `route`
-- `experimental`
-
-### 5.1 `log`
-
-用途：
-- 控制日志级别
-- 开启时间戳
-
-### 5.2 `dns`
-
-用途：
-- 定义 DNS 服务器
-- 指定默认解析器
-- 定义 DNS 规则
-- 尽量降低 DNS 泄漏
-
-### 5.3 `inbounds`
-
-当前仅使用：
-- `type: socks`
-
-用途：
-- 为本地不同端口提供多个 `SOCKS5` 入口
-
-### 5.4 `outbounds`
-
-当前使用的出站包括：
-
-- `direct`
-- `block`
-- 订阅节点出站
-- 手动节点出站
-- 节点组出站
-- `proxy`
-- `auto`
-
-### 5.5 `route`
-
-用途：
-- 根据入站匹配把流量发到指定出站
-- 控制默认出口
-- 控制默认域名解析器
-
-### 5.6 `experimental`
-
-当前使用：
-- `cache_file`
-- `clash_api`
-
-用途：
-- 提供缓存和兼容控制接口
+- `internal/app/app.go`
+  - API 路由、配置读写、订阅刷新、运行时启动/停止、内核下载、日志收集。
+- `internal/app/subscription_parser.go`
+  - URI 订阅、Base64 订阅、Clash/Mihomo YAML 与兼容兜底解析。
+- `internal/app/config_builder.go`
+  - 合并订阅节点和手动节点，生成 sing-box `inbounds`、`outbounds`、`route`、`dns`、`experimental` 配置。
+- `internal/public/*.js`
+  - Web UI 状态管理、表单编辑、节点管理、SOCKS5 服务配置与一键配置流程。
 
 ---
 
-## 6. 当前节点与节点组模型
+## 4. 订阅解析策略
 
-### 6.1 节点来源
+### URI 订阅
 
-当前节点分为三类：
+支持：
 
-- 内置节点
-  - `direct`
-- 订阅节点
-  - 从机场订阅解析而来
-- 手动节点
-  - 用户在节点管理页自行添加
+- `vmess://`
+- `vless://`
+- `trojan://`
+- `ss://`
+- `socks://` / `socks5://`
+- `hysteria2://` / `hy2://`
+- `tuic://`
 
-### 6.2 节点组
+解析时会处理常见 TLS、Reality、transport、grpc、ws、tcp 等参数，并尽量转换为 sing-box 出站结构。
 
-当前节点组支持：
+### Clash/Mihomo YAML
 
-- `urltest`
-- `fallback`
+当普通 URI 解析为空时，会尝试按 YAML 解析并读取 `proxies`。
 
-说明：
-- `urltest` 已直接映射为 `sing-box` 的 `urltest`
-- `fallback` 当前为了兼容和稳定，暂时映射为更安全的选择器式行为，不完全等价于复杂原生 fallback 行为
+当前覆盖类型：
 
-### 6.3 主页可选出口
-
-主页的默认路由出口和 `SOCKS5` 目标出口下拉框来自统一的可选出口列表。
-
-当前包含：
-- `proxy`
-- `auto`
-- `direct`
-- `block`
-- 所有订阅节点
-- 所有手动节点
-- 所有节点组
-
----
-
-## 7. 当前 DNS 实现思路
-
-这是当前阶段最重要的实现背景之一。
-
-### 7.1 早期问题
-
-此前出现过这些实际问题：
-
-- 使用旧版 DNS 结构，`sing-box` 新版本报弃用或直接报错
-- 使用 `rcode://` 等旧形式会报：
-  - `unknown transport type: rcode`
-- 使用旧 inbound 字段会报：
-  - `legacy inbound fields are deprecated`
-- 代理端口虽能监听，但访问 Google 时 DNS 查询超时
-
-### 7.2 当前解决方案
-
-当前实际采用：
-
-- 远程 DoH：
-  - `https://cloudflare-dns.com/dns-query`
-- 引导 DNS：
-  - `223.5.5.5:53`
-- `dns-remote`
-  - 走代理出站
-- `dns-bootstrap`
-  - 作为域名解析引导器
-- `dns-direct`
-  - 本地直连解析器
-
-### 7.3 当前关键修复点
-
-真实修复过程里确认了以下结论：
-
-- 直接用 `https://1.1.1.1/dns-query` 作为默认 DoH 容易出现证书 / SNI / 解析问题
-- 给 `dns-bootstrap` 显式设置 `detour: direct` 会导致：
-  - `detour to an empty direct outbound makes no sense`
-- 将 `route.default_domain_resolver.server` 切到 `dns-bootstrap` 后，Google / Gstatic 代理访问恢复正常
-
-### 7.4 当前最终策略
-
-- 默认流量仍走代理出口
-- 域名首次解析优先使用引导 DNS
-- 远程 DoH 作为代理环境下的远程解析器
-- 这样兼顾了：
-  - 出网成功率
-  - 远程 DNS 使用
-  - 降低本机 DNS 泄漏风险
-
----
-
-## 8. 当前订阅解析背景
-
-### 8.1 当前支持的输入形式
-
-- 普通按行分发的节点链接
-- Base64 编码订阅文本
-- URL Safe Base64 订阅
-- 混合内容
-
-### 8.2 当前支持协议
-
+- `ss`
+- `trojan`
 - `vmess`
 - `vless`
-- `trojan`
-- `shadowsocks`
-- `hysteria2`
+- `socks` / `socks5`
+- `http`
+- `hysteria2` / `hy2`
 - `tuic`
+- `anytls`
+- `ssr`（兼容映射）
+- `snell`
+- `wireguard`
 
-### 8.3 当前已修复的典型问题
+未知类型会进入兜底策略：尝试按 `http`、`shadowsocks`、`socks` 形态映射。兜底节点会附带：
 
-- `shadowsocks` 某些 `userinfo` 为 Base64 的格式此前会被识别失败
-- 现在已支持类似：
-  - `ss://<base64-userinfo>@host:port#tag`
-
-### 8.4 当前限制
-
-- 不同机场会加入私有字段
-- 私有参数可能仍需继续兼容
-- 某些非常规 URI 仍可能需要追加解析规则
+- `tag` 前缀：`[fallback]`
+- `compat_fallback: true`
+- `compat_origin_type: <原始类型>`
 
 ---
 
-## 9. 当前内核下载背景
+## 5. 节点组策略
 
-### 9.1 当前识别方式
+### urltest
 
-当前通过：
+生成 sing-box 原生 `urltest` 出站，根据测试地址、间隔和容差选择较优成员。一键配置 SOCKS5 服务时，会为全部可用节点创建一个 `urltest` 节点组作为首个服务出口。
 
-- `process.platform`
-- `process.arch`
+### fallback
 
-映射到：
+生成 sing-box 原生 `selector` 出站，默认选择成员列表第一个节点。当前 UI 保留状态展示入口，后续可以继续增强为更完整的健康检查切换。
 
-- `windows-amd64`
-- `windows-arm64`
-- `linux-amd64`
-- `linux-arm64`
-- `darwin-amd64`
-- `darwin-arm64`
+### 配置迁移
 
-### 9.2 当前下载逻辑
+配置加载和保存时会执行规范化：
 
-- 检测架构
-- 获取版本列表
-- 选择计划版本
-- 匹配当前架构资产
-- 下载压缩包
-- 解压安装内核
-- 更新 `app.singBoxBinary`
-
-### 9.3 版本列表策略
-
-当前版本列表会固化到文件：
-
-- `D:\sub2socks5\data\release-list.json`
-
-策略：
-- 有本地版本列表时优先读取本地
-- 用户点击“检查版本更新”时再主动从 GitHub 同步
+- 空策略名会补为 `urltest`。
+- 非原生历史策略名会改写为 `urltest`。
+- 历史运行态缓存会从主配置中移除。
 
 ---
 
-## 10. 当前 Web UI 交互模型
+## 6. DNS 与运行时
 
-### 10.1 主页
-
-当前主页包含：
-
-- 架构检测
-- 内核状态查看
-- 版本列表选择
-- 拉取内核
-- 基础配置编辑
-- 订阅更新
-- 节点管理入口
-- 运行状态
-- 生成结果
-- 实时日志选项卡
-
-### 10.2 视图模式
-
-当前大部分区域支持：
-
-- 表单模式
-- JSON 模式
-
-说明：
-- 高频字段优先在表单模式下编辑
-- 复杂结构可切换到 JSON 模式查看
-
-### 10.3 节点管理页
-
-当前节点管理页支持：
-
-- 手动节点管理
-- 节点组管理
-- 节点组成员按行添加
-- 保存后主页自动刷新出口列表
+- 默认 DoH：`https://cloudflare-dns.com/dns-query`。
+- 默认 bootstrap DNS：`1.1.1.1`。
+- DoH 查询默认通过 `proxy` 绕行，目标是降低本机明文 DNS 泄漏。
+- 运行时配置保存到 `internal/runtime/sing-box.json`。
+- 如果 sing-box 正在运行，保存配置后会重启运行时以应用配置。
 
 ---
 
-## 11. 当前测试材料与测试方法
+## 7. 内核管理
 
-### 11.1 当前测试材料
+Web UI 支持：
 
-当前已经用于实际联调的材料包括：
+- 检测当前系统架构。
+- 从缓存读取 Release 列表。
+- 手动检查版本更新。
+- 手动选择系统架构和版本。
+- 下载并替换计划版本内核。
 
-- 真实机场订阅链接
-- 已安装的 `sing-box.exe`
-- 生成后的 `runtime\sing-box.json`
-- PowerShell
-- `curl.exe`
-- Google / Gstatic 的 `generate_204` 接口
-
-### 11.2 当前测试指标
-
-当前关注：
-
-- Web UI 是否可访问
-- 节点是否能解析成功
-- 节点组保存后主页是否立即可见
-- `sing-box` 是否能正常启动
-- `SOCKS5` 端口是否监听成功
-- 通过代理访问外部站点是否成功
-
-### 11.3 当前已验证通过的结果
-
-已经真实验证通过：
-
-- `SOCKS5` 端口监听成功
-- 通过代理访问：
-  - `https://www.google.com/generate_204`
-  - `https://www.gstatic.com/generate_204`
-- 返回码均为：
-  - `204`
-
-说明：
-- 这代表当前代理链路、DNS、出站转发在现阶段已经可以正常工作
+Release 资产选择会避开 Windows legacy 版本，并按系统与架构匹配对应压缩包。
 
 ---
 
-## 12. 当前已知限制
+## 8. 测试覆盖
 
-- `singbox-manager.js` 在当前某些沙箱环境下直接 `spawn` `sing-box.exe` 会遇到 `EPERM`
-  - 这属于当前测试环境限制，不是最终 Windows 实机必然问题
-- 节点组 `fallback` 还不是完整高级语义实现
-- 手动节点表单仍比较基础
-- 某些复杂协议私有参数还未完全补齐
-- 目前更偏向“可用原型 + 持续修正”，不是最终成熟版控制面板
+当前测试重点：
 
----
+- `subscription_parser_test.go`
+  - Clash YAML 基础解析。
+  - 未知类型 fallback 标记。
+- `config_builder_test.go`
+  - `urltest` 节点组生成 sing-box 原生 `urltest`。
+  - 历史策略名迁移为 `urltest`。
+  - SOCKS5 入站端口保持用户配置，不做额外重写。
+  - `collectOutbounds` 输出节点、节点组、链式代理和内置出口。
 
-## 13. 后续继续开发时优先关注
+推荐验证命令：
 
-建议继续优先核对：
-
-- 官方 `sing-box` 最新 DNS 配置结构
-- 各协议出站字段是否继续变化
-- `route.rules` / `action` 的最新写法
-- `selector` / `urltest` / `direct` / `block` 是否新增字段
-- 节点组高级能力是否可继续完善
-- 手动节点表单是否按协议细分
-
----
-
-## 14. 本文件用途
-
-本文件不是官方文档副本，而是当前项目阶段的工程背景记录。
-
-它主要用于：
-
-- 记录当前真正用到了哪些技术
-- 记录实现过程中参考了哪些材料
-- 记录项目与 `sing-box` 配置概念之间的映射关系
-- 记录当前已经踩过和修掉的关键问题
-- 方便后续继续开发时减少重复排查成本
-
----
-
-## 15. Go 单文件打包信息
-
-当前项目已改为 Go 原生单文件构建，不再使用 Node.js SEA。
-
-### 前置要求
-
-- Go 1.23+
-- 在项目根目录执行构建命令
-
-### 构建命令
-
-```powershell
-go build -trimpath -ldflags "-s -w" -o dist/sub2socks5-windows-x64.exe .
+```bash
+go test ./...
+go build ./...
+node --check internal/public/app.js
+node --check internal/public/nodes.js
 ```
 
-### 输出位置
+---
 
-- `D:\sub2socks5\dist\sub2socks5-windows-x64.exe`
+## 9. GitHub Actions
 
-### 当前单文件打包链路
+当前工作流目标：
 
-当前流程涉及以下文件：
-
-- `main.go`
-  - 程序入口
-  - 通过 `embed` 将 `internal/public/*` 打包进可执行文件
-  - 把嵌入静态文件系统传给应用层
-- `internal/app/app.go`
-  - 提供 `RunWithStaticFS()` 启动入口
-  - 静态资源优先从嵌入 FS 读取
-  - 无嵌入时可回退到本地目录读取，方便开发调试
-
-### 运行特征
-
-- 可执行文件内嵌：
-  - Go 业务逻辑
-  - `internal/public` 静态资源
-- `sing-box` 内核不会嵌入 exe
-- 用户配置与运行时状态不会嵌入二进制，仍持久化到：
-  - `internal/data`
-  - `internal/runtime`
-  - `internal/bin`
-
-### 已处理的问题
-
-- 修复 Windows 下静态资源路径清理导致嵌入文件读取失败的问题
-  - 原因：`filepath.Clean` 在 Windows 使用反斜杠，不符合 `embed` FS 路径语义
-  - 方案：静态 URL 路径改用 `path.Clean`
-  - 验证：访问 `http://127.0.0.1:18080/` 返回 200
-
-### 当前注意事项
-
-- 若只拷贝 exe 运行，首次启动会自动创建 `internal/data`、`internal/runtime`、`internal/bin`
-- 如果用于正式分发，建议进行代码签名
+- 手动触发全平台构建。
+- 每个平台和架构单独构建二进制。
+- artifact 直接上传单个二进制文件，避免双重压缩。
+- Release 工作流使用唯一 tag，避免再次执行时覆盖上一次发布。
+- 构建前执行 `go test ./...`，防止测试失败仍产物发布。
 
 ---
 
-## 16. GitHub Actions 构建与发布
+## 10. 后续优化方向
 
-当前项目已接入 GitHub Actions，用于手动触发全平台构建，以及手动触发构建后发布到 GitHub Release。
+1. 继续把 `app.go` 拆分为配置、订阅、运行时、内核下载等独立文件。
+2. 增加更多 Clash YAML 样本驱动测试。
+3. 增强 `fallback` 策略的健康检查和 UI 状态展示。
+4. 支持 Clash `proxy-providers` 远端拉取。
+5. 为 Web UI 增加更细粒度的错误提示与配置校验。
 
-### 工作流结构
+---
 
-- `D:\sub2socks5\.github\workflows\reusable-build.yml`
-  - 可复用构建模板
-  - 统一维护平台与架构矩阵（Go 交叉编译）
-  - 支持按参数切换“直接上传单文件”与“先打 zip 再上传”
-  - 支持可选 smoke test，验证首页可访问
-- `D:\sub2socks5\.github\workflows\build.yml`
-  - 手动触发
-  - 只构建，不发布
-  - 直接上传单个二进制 artifact
-- `D:\sub2socks5\.github\workflows\release.yml`
-  - 手动触发
-  - 先调用构建流程，再自动发布到 GitHub Release
-  - 发布时按平台/架构生成 zip
+## 11. 参考资料
 
-### 当前构建目标
-
-- `linux-x64`
-- `linux-arm64`
-- `windows-x64`
-- `windows-arm64`
-- `macos-x64`
-- `macos-arm64`
-
-### 产物策略
-
-- 每个平台/架构单独构建一个二进制文件
-- 每个平台/架构单独打包为一个 zip
-- 每个 zip 只包含一个二进制文件
-
-当前产物命名示例：
-
-- `sub2socks5-linux-x64.zip`
-- `sub2socks5-linux-arm64.zip`
-- `sub2socks5-windows-x64.zip`
-- `sub2socks5-windows-arm64.zip`
-- `sub2socks5-macos-x64.zip`
-- `sub2socks5-macos-arm64.zip`
-
-### 发布流程说明
-
-`Release` 工作流需要输入：
-
-- `release_tag_prefix`
-- `release_name`
-
-执行流程为：
-
-1. 构建全部平台与架构
-2. 按平台/架构分别打包 zip
-3. 收集所有 zip artifact
-4. 创建或更新对应的 GitHub Release
-5. 把所有 zip 上传为 Release 附件
-
-### 工程意义
-
-- 把构建矩阵抽到 `reusable-build.yml` 后，只需维护一份平台配置
-- `build.yml` 与 `release.yml` 已实现职责分离
-- 后续若要增减平台、架构或调整命名规则，只需要优先修改 `D:\sub2socks5\.github\workflows\reusable-build.yml`
-### `D:\sub2socks5\internal\public\nodes-edit.js`
-
-职责：
-- 手动节点表单与原始导入混合编辑
-- 导入后节点归一化与兼容处理
-
-### `D:\sub2socks5\internal\public\socks5.js`
-
-职责：
-- SOCKS5 服务单独编辑页
-- 端口推荐、冲突规避、批量删除与保存
-
-## 17. 现阶段新增成果（本轮）
-
-### 17.1 稳定性与运行控制
-
-- 已实现 sing-box 异常退出自动拉起（退避重启）
-- 手动停止状态与异常退出状态已分离，避免误重启
-- 保存配置/保存节点后若 runtime 运行中会自动重启应用新配置
-
-### 17.2 路由与端口行为修复
-
-- 已修复多 SOCKS5 端口共用同一路由出口问题
-  - 为每个端口生成 `route.rules` 绑定 `inbound -> outbound`
-- 已增强端口分配逻辑
-  - 批量创建服务时通过 `/api/ports/next` + `exclude` 规避冲突
-
-### 17.3 测速链路增强
-
-- 节点全量测速并发模型升级为固定 5 并发滑动窗口
-  - 前置慢节点不会阻塞后续节点调度
-- 单节点测速与全量测速均支持：
-  - 内核未运行时自动拉起
-  - 测速结束恢复初始运行状态
-- 后端测速错误信息已细化
-  - 控制接口未就绪、超时、HTTP 错误可区分
-
-### 17.4 一键配置 SOCKS5 服务
-
-- 已支持“按测速通过结果生成服务”
-  - 仅为连通性测试通过节点创建 SOCKS5 服务
-- 已支持可视化进度遮罩
-  - 步骤状态、节点测试进度、当前细节
-  - 支持用户取消（含二次确认）
-
-### 17.5 协议兼容性补全
-
-- `hysteria2` 解析补全：
-  - 认证字段兼容 `auth/password/token`
-  - 速率字段兼容 `up/down/upmbps/downmbps`
-  - 支持 `obfs/salamander` 相关参数
-- `tuic` 解析修复：
-  - `alpn` 改写为 `tls.alpn`，修复 `unknown field "alpn"` 启动错误
-  - 支持 `zero_rtt_handshake` 参数解析
-
-### 17.6 前端编辑能力完善
-
-- 节点编辑页表单模式补全多协议参数输入项
-- 单行/JSON 导入后新增归一化逻辑
-  - 兼容部分 v2ray 风格 hysteria 节点结构转换
+- sing-box 文档（中文）：https://sing-box.sagernet.org/zh/configuration/
+- sing-box 仓库：https://github.com/SagerNet/sing-box
+- sing-box Releases：https://github.com/SagerNet/sing-box/releases
+- v2rayN（解析兼容参考）：https://github.com/2dust/v2rayN

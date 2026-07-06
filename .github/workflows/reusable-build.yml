@@ -67,6 +67,10 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Run unit tests
+        shell: bash
+        run: go test ./...
+
       - name: Prepare output directory
         shell: bash
         run: mkdir -p dist

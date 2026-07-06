@@ -20,8 +20,7 @@ let state = {
   groups: [],
   chains: [],
   availableOutbounds: [],
-  fallbackStates: {},
-  rotateStates: {}
+  fallbackStates: {}
 };
 
 let nodeDelayState = {};
@@ -41,8 +40,7 @@ async function load() {
     ...state,
     ...data,
     chains: Array.isArray(data.chains) ? data.chains : [],
-    fallbackStates: data.fallbackStates || {},
-    rotateStates: data.rotateStates || {}
+    fallbackStates: data.fallbackStates || {}
   };
   render();
 }
@@ -105,13 +103,7 @@ function renderGroups() {
 
 function buildGroupPanel(index, group, selectableNodes) {
   const fallbackState = state.fallbackStates?.[group.tag] || null;
-  const rotateState = state.rotateStates?.[group.tag] || null;
-  const rotateCurrent = group.strategy === 'rotate'
-    ? (rotateState?.current || group.members?.[0] || '')
-    : '';
-  const groupTitle = group.strategy === 'rotate' && rotateCurrent
-    ? `${group.tag || `节点组 ${index + 1}`} -> ${rotateCurrent}`
-    : (group.tag || `节点组 ${index + 1}`);
+  const groupTitle = group.tag || `节点组 ${index + 1}`;
   const expanded = expandedGroups.has(index);
   const selectedMembers = Array.isArray(group.members) ? group.members : [];
   const summaryCards = selectedMembers.map((memberTag) => {
@@ -132,20 +124,7 @@ function buildGroupPanel(index, group, selectableNodes) {
         </div>
       </div>
     `
-    : (group.strategy === 'rotate'
-      ? `
-        <div class="kv-grid">
-          <div class="kv-item">
-            <div class="key">当前轮转节点</div>
-            <div class="value">${escapeHtml(rotateCurrent || '')}</div>
-          </div>
-          <div class="kv-item">
-            <div class="key">最近切换时间</div>
-            <div class="value">${escapeHtml(rotateState?.updatedAt || '')}</div>
-          </div>
-        </div>
-      `
-      : '');
+    : '';
 
   const item = document.createElement('div');
   item.className = 'timeline-item group-panel';
@@ -171,7 +150,6 @@ function buildGroupPanel(index, group, selectableNodes) {
           <select data-kind="group" data-index="${index}" data-field="strategy">
             <option value="urltest" ${group.strategy === 'urltest' ? 'selected' : ''}>urltest</option>
             <option value="fallback" ${group.strategy === 'fallback' ? 'selected' : ''}>fallback</option>
-            <option value="rotate" ${group.strategy === 'rotate' ? 'selected' : ''}>rotate</option>
           </select>
         </label>
         <label>
