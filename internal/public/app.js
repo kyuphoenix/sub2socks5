@@ -733,12 +733,12 @@ async function autoConfigureSocksServicesFromOutbounds() {
       await post('/api/runtime/start');
       await waitForRuntimeReady();
     }
-    updateSocksConfigOverlay('节点测速', 0, outbounds.length, '正在批量测速节点连通性...');
+    updateSocksConfigOverlay('节点延迟测试', 0, outbounds.length, '正在批量测试节点延迟...');
     connectivity = await checkOutboundsConnectivity(outbounds.map((item) => item.tag));
   } catch (error) {
     hideSocksConfigOverlay();
     socksConfigAbortController = null;
-    throw new Error(`测速前准备失败：${error.message}`);
+    throw new Error(`延迟测试前准备失败：${error.message}`);
   } finally {
     if (!runtimeWasRunning) {
       await post('/api/runtime/stop');
@@ -748,7 +748,7 @@ async function autoConfigureSocksServicesFromOutbounds() {
   if (!passedOutbounds.length) {
     hideSocksConfigOverlay();
     socksConfigAbortController = null;
-    throw new Error('没有测速通过的节点，未创建 SOCKS5 服务');
+    throw new Error('没有通过延迟测试的节点，未创建 SOCKS5 服务');
   }
 
   updateSocksConfigOverlay('出口识别', 0, passedOutbounds.length, '正在识别节点出口 IP...');
@@ -793,7 +793,7 @@ async function autoConfigureSocksServicesFromOutbounds() {
   latestData.config.nodeRegistry ||= {};
   latestData.config.nodeRegistry.groups = mergedGroups;
 
-  updateSocksConfigOverlay('生成服务', passedOutbounds.length, outbounds.length, '正在为测速通过节点分配端口...');
+  updateSocksConfigOverlay('生成服务', passedOutbounds.length, outbounds.length, '正在为延迟测试通过的节点分配端口...');
   const host = '127.0.0.1';
   const used = new Set();
   const appPort = Number(fields.appPort.value || latestData.config?.app?.port || 18080);
@@ -868,7 +868,7 @@ async function checkOutboundsConnectivity(tags) {
       cursor += 1;
       if (current >= tags.length) return;
       const tag = tags[current];
-      updateSocksConfigOverlay('节点测速', completed, tags.length, `正在测试节点：${tag}`);
+      updateSocksConfigOverlay('节点延迟测试', completed, tags.length, `正在测试节点：${tag}`);
       try {
         const response = await fetch('/api/nodes/check', {
           method: 'POST',
@@ -880,7 +880,7 @@ async function checkOutboundsConnectivity(tags) {
         if (!response.ok) {
           throw new Error(extractErrorMessage(data, response));
         }
-        results[tag] = data.results?.[tag] || { ok: false, error: '测速失败' };
+        results[tag] = data.results?.[tag] || { ok: false, error: '延迟测试失败' };
       } catch (error) {
         if (error?.name === 'AbortError') {
           throw new Error('用户取消了操作');
@@ -888,7 +888,7 @@ async function checkOutboundsConnectivity(tags) {
         results[tag] = { ok: false, error: error.message };
       } finally {
         completed += 1;
-        updateSocksConfigOverlay('节点测速', completed, tags.length, `已完成 ${completed}/${tags.length}`);
+        updateSocksConfigOverlay('节点延迟测试', completed, tags.length, `已完成 ${completed}/${tags.length}`);
       }
     }
   };

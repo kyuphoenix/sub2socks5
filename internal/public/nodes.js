@@ -71,7 +71,7 @@ function renderAvailableNodes() {
   for (const node of visibleNodes) {
     const delayState = nodeDelayState[node.tag];
     const isChecking = checkingNodeTags.has(node.tag) || delayState?.loading;
-    const delayText = isChecking ? '测速中...' : delayState?.text || 'check';
+    const delayText = isChecking ? '测试中...' : delayState?.text || '延迟';
     const card = document.createElement('div');
     card.className = 'node-pill node-pill-checkable';
     card.innerHTML = `
@@ -82,7 +82,7 @@ function renderAvailableNodes() {
           <span class="node-pill-tag is-source">${escapeHtml(sourceLabel(node.source))}</span>
         </div>
       </div>
-      <button type="button" class="node-check-button ${isChecking ? 'is-loading' : ''}" data-check-node="${escapeHtmlAttr(node.tag)}" title="点击测速">${escapeHtml(delayText)}</button>
+      <button type="button" class="node-check-button ${isChecking ? 'is-loading' : ''}" data-check-node="${escapeHtmlAttr(node.tag)}" title="点击测试延迟">${escapeHtml(delayText)}</button>
     `;
     availableNodeListEl.appendChild(card);
   }
@@ -295,7 +295,7 @@ function sourceLabel(source) {
 async function checkNode(tag) {
   if (checkingNodeTags.has(tag)) return;
   checkingNodeTags.add(tag);
-  nodeDelayState[tag] = { loading: true, text: '测速中...' };
+  nodeDelayState[tag] = { loading: true, text: '测试中...' };
   renderAvailableNodes();
   try {
     const runtimeWasRunning = await ensureRuntimeRunning();
@@ -306,7 +306,7 @@ async function checkNode(tag) {
     });
     const data = await response.json();
     if (!response.ok) {
-      throw new Error(data?.error?.message || '测速失败');
+      throw new Error(data?.error?.message || '延迟测试失败');
     }
     const result = data.results?.[tag];
     nodeDelayState[tag] = result?.ok
@@ -315,8 +315,8 @@ async function checkNode(tag) {
           checkedAt: result.checkedAt,
           checkedTag: result.checkedTag
         }
-      : { text: '失败', error: result?.error || '测速失败' };
-    setStatus(`节点 ${tag} 测速完成`, 'success');
+      : { text: '失败', error: result?.error || '延迟测试失败' };
+    setStatus(`节点 ${tag} 延迟测试完成`, 'success');
     if (!runtimeWasRunning) {
       await stopRuntime();
     }
@@ -335,14 +335,14 @@ async function checkNode(tag) {
 async function checkAllNodes() {
   const tags = getSelectableNodes().map((item) => item.tag);
   if (!tags.length) {
-    setStatus('当前没有可测速节点', 'idle');
+    setStatus('当前没有可测试延迟的节点', 'idle');
     return;
   }
 
   const runtimeWasRunning = await ensureRuntimeRunning();
-  setStatus('正在分批刷新全部节点测速...', 'loading');
+  setStatus('正在分批测试全部节点延迟...', 'loading');
   for (const tag of tags) {
-    nodeDelayState[tag] = { loading: true, text: '测速中...' };
+    nodeDelayState[tag] = { loading: true, text: '测试中...' };
   }
   renderAvailableNodes();
 
@@ -357,13 +357,13 @@ async function checkAllNodes() {
       });
       const data = await response.json();
       if (!response.ok) {
-        throw new Error(data?.error?.message || '批量测速失败');
+        throw new Error(data?.error?.message || '批量延迟测试失败');
       }
       for (const tag of batch) {
         const result = data.results?.[tag];
         nodeDelayState[tag] = result?.ok
           ? { text: result.text, checkedAt: result.checkedAt, checkedTag: result.checkedTag }
-          : { text: '失败', error: result?.error || '测速失败' };
+          : { text: '失败', error: result?.error || '延迟测试失败' };
         if (!result?.ok) hasError = true;
       }
       renderAvailableNodes();
@@ -378,10 +378,10 @@ async function checkAllNodes() {
   }
 
   if (hasError) {
-    setStatus('部分节点测速失败，请重试', 'error');
+    setStatus('部分节点延迟测试失败，请重试', 'error');
     return;
   }
-  setStatus('全部节点测速完成', 'success');
+  setStatus('全部节点延迟测试完成', 'success');
 }
 
 async function ensureRuntimeRunning() {

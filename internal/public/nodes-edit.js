@@ -9,50 +9,207 @@ const formPortEl = document.getElementById('manual-form-port');
 const formFieldsEl = document.getElementById('manual-form-fields');
 const NODES_UPDATED_KEY = 'sub2socks5:nodes-updated-at';
 
+const PROTOCOL_LABELS = {
+  vless: 'VLESS',
+  vmess: 'VMess',
+  trojan: 'Trojan',
+  shadowsocks: 'Shadowsocks',
+  socks: 'SOCKS5',
+  hysteria2: 'Hysteria2',
+  tuic: 'TUIC'
+};
+
+const PROTOCOL_DEFAULT_PORTS = {
+  shadowsocks: 8388,
+  socks: 1080
+};
+
+const TLS_FINGERPRINT_OPTIONS = [
+  { value: '', label: '不启用 uTLS' },
+  { value: 'chrome', label: 'Chrome' },
+  { value: 'firefox', label: 'Firefox' },
+  { value: 'edge', label: 'Edge' },
+  { value: 'safari', label: 'Safari' },
+  { value: 'ios', label: 'iOS' },
+  { value: 'android', label: 'Android' },
+  { value: 'random', label: '随机指纹' }
+];
+
+const TRANSPORT_FIELDS = [
+  {
+    key: 'transportType',
+    label: '传输方式',
+    type: 'select',
+    group: '传输设置',
+    defaultValue: 'tcp',
+    options: [
+      { value: 'tcp', label: 'TCP（无额外传输层）' },
+      { value: 'ws', label: 'WebSocket' },
+      { value: 'grpc', label: 'gRPC' },
+      { value: 'http', label: 'HTTP' }
+    ]
+  },
+  {
+    key: 'transportHost',
+    label: 'Host',
+    group: '传输设置',
+    placeholder: 'cdn.example.com',
+    help: 'WebSocket 请求头或 HTTP Host。',
+    showWhen: { field: 'transportType', values: ['ws', 'http'] }
+  },
+  {
+    key: 'transportPath',
+    label: 'Path',
+    group: '传输设置',
+    placeholder: '/',
+    help: '留空时使用 /。',
+    showWhen: { field: 'transportType', values: ['ws', 'http'] }
+  },
+  {
+    key: 'grpcServiceName',
+    label: 'gRPC Service Name',
+    group: '传输设置',
+    placeholder: 'grpc-service',
+    showWhen: { field: 'transportType', values: ['grpc'] }
+  }
+];
+
 const FORM_PROTOCOLS = {
   vless: [
-    { key: 'uuid', label: 'UUID' },
-    { key: 'flow', label: 'Flow' },
-    { key: 'tlsServerName', label: 'SNI' },
-    { key: 'tlsInsecure', label: '允许不安全 TLS', type: 'bool' }
+    { key: 'uuid', label: 'UUID', group: '认证信息', required: true, placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' },
+    {
+      key: 'flow',
+      label: 'Flow',
+      type: 'select',
+      group: '认证信息',
+      options: [
+        { value: '', label: '无' },
+        { value: 'xtls-rprx-vision', label: 'xtls-rprx-vision' }
+      ]
+    },
+    {
+      key: 'tlsMode',
+      label: 'TLS 模式',
+      type: 'select',
+      group: 'TLS 设置',
+      defaultValue: 'tls',
+      options: [
+        { value: 'none', label: '不启用 TLS' },
+        { value: 'tls', label: 'TLS' },
+        { value: 'reality', label: 'Reality' }
+      ]
+    },
+    { key: 'tlsServerName', label: 'SNI', group: 'TLS 设置', placeholder: 'front.example.com', showWhen: { field: 'tlsMode', values: ['tls', 'reality'] } },
+    { key: 'tlsInsecure', label: '跳过证书验证', type: 'bool', group: 'TLS 设置', showWhen: { field: 'tlsMode', values: ['tls', 'reality'] } },
+    { key: 'tlsFingerprint', label: 'TLS 指纹', type: 'select', group: 'TLS 设置', defaultValue: 'chrome', options: TLS_FINGERPRINT_OPTIONS, help: 'Reality 客户端必须启用 uTLS，推荐使用 Chrome。', showWhen: { field: 'tlsMode', values: ['tls', 'reality'] } },
+    { key: 'realityPublicKey', label: 'Reality Public Key', group: 'TLS 设置', required: true, placeholder: '服务端 Reality 公钥', showWhen: { field: 'tlsMode', values: ['reality'] } },
+    { key: 'realityShortID', label: 'Reality Short ID', group: 'TLS 设置', placeholder: '例如 6ba85179e30d4fc2', showWhen: { field: 'tlsMode', values: ['reality'] } },
+    ...TRANSPORT_FIELDS
   ],
   vmess: [
-    { key: 'uuid', label: 'UUID' },
-    { key: 'security', label: 'Security', defaultValue: 'auto' },
-    { key: 'alter_id', label: 'Alter ID', defaultValue: '0' },
-    { key: 'tlsServerName', label: 'SNI' },
-    { key: 'tlsInsecure', label: '允许不安全 TLS', type: 'bool' }
+    { key: 'uuid', label: 'UUID', group: '认证信息', required: true, placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' },
+    {
+      key: 'security',
+      label: '加密方式',
+      type: 'select',
+      group: '认证信息',
+      defaultValue: 'auto',
+      options: ['auto', 'aes-128-gcm', 'chacha20-poly1305', 'none']
+    },
+    { key: 'alter_id', label: 'Alter ID', type: 'number', group: '认证信息', defaultValue: 0, min: 0, step: 1 },
+    {
+      key: 'tlsMode',
+      label: 'TLS 模式',
+      type: 'select',
+      group: 'TLS 设置',
+      defaultValue: 'tls',
+      options: [
+        { value: 'none', label: '不启用 TLS' },
+        { value: 'tls', label: 'TLS' }
+      ]
+    },
+    { key: 'tlsServerName', label: 'SNI', group: 'TLS 设置', placeholder: 'front.example.com', showWhen: { field: 'tlsMode', values: ['tls'] } },
+    { key: 'tlsInsecure', label: '跳过证书验证', type: 'bool', group: 'TLS 设置', showWhen: { field: 'tlsMode', values: ['tls'] } },
+    { key: 'tlsFingerprint', label: 'TLS 指纹', type: 'select', group: 'TLS 设置', options: TLS_FINGERPRINT_OPTIONS, showWhen: { field: 'tlsMode', values: ['tls'] } },
+    ...TRANSPORT_FIELDS
   ],
   trojan: [
-    { key: 'password', label: 'Password' },
-    { key: 'tlsServerName', label: 'SNI' },
-    { key: 'tlsInsecure', label: '允许不安全 TLS', type: 'bool' }
+    { key: 'password', label: '密码', group: '认证信息', required: true, placeholder: 'Trojan 密码' },
+    { key: 'tlsServerName', label: 'SNI', group: 'TLS 设置', placeholder: 'front.example.com' },
+    { key: 'tlsInsecure', label: '跳过证书验证', type: 'bool', group: 'TLS 设置' },
+    { key: 'tlsFingerprint', label: 'TLS 指纹', type: 'select', group: 'TLS 设置', options: TLS_FINGERPRINT_OPTIONS },
+    ...TRANSPORT_FIELDS
   ],
   shadowsocks: [
-    { key: 'method', label: 'Method' },
-    { key: 'password', label: 'Password' }
+    {
+      key: 'method',
+      label: '加密方式',
+      type: 'datalist',
+      group: '认证信息',
+      required: true,
+      defaultValue: 'aes-256-gcm',
+      options: [
+        'aes-128-gcm',
+        'aes-256-gcm',
+        'chacha20-ietf-poly1305',
+        '2022-blake3-aes-128-gcm',
+        '2022-blake3-aes-256-gcm',
+        '2022-blake3-chacha20-poly1305'
+      ],
+      help: '可从常用算法中选择，也可以直接输入其他 sing-box 支持的算法。'
+    },
+    { key: 'password', label: '密码', group: '认证信息', required: true, placeholder: 'Shadowsocks 密码' }
   ],
   socks: [
-    { key: 'username', label: 'Username' },
-    { key: 'password', label: 'Password' }
+    { key: 'username', label: '用户名', group: '认证信息', placeholder: '可选' },
+    { key: 'password', label: '密码', group: '认证信息', placeholder: '可选' }
   ],
   hysteria2: [
-    { key: 'password', label: 'Password' },
-    { key: 'tlsServerName', label: 'SNI' },
-    { key: 'tlsInsecure', label: '允许不安全 TLS', type: 'bool' },
-    { key: 'up_mbps', label: '上行 Mbps' },
-    { key: 'down_mbps', label: '下行 Mbps' },
-    { key: 'obfsType', label: '混淆类型(obfs)' },
-    { key: 'obfsPassword', label: '混淆密码' }
+    { key: 'password', label: '认证密码', group: '认证信息', required: true, placeholder: 'Hysteria2 auth/password' },
+    { key: 'serverPorts', label: '端口跳跃', group: '连接设置', placeholder: '20000-30000,40000', help: '多个端口用逗号分隔，范围可写成 20000-30000。' },
+    { key: 'tlsServerName', label: 'SNI', group: 'TLS 设置', placeholder: 'front.example.com' },
+    { key: 'tlsInsecure', label: '跳过证书验证', type: 'bool', group: 'TLS 设置' },
+    { key: 'tlsAlpn', label: 'ALPN', group: 'TLS 设置', defaultValue: 'h3', placeholder: 'h3', help: '多个值用逗号分隔。' },
+    { key: 'up_mbps', label: '上行带宽（Mbps）', type: 'number', group: '性能与混淆', min: 1, step: 1, placeholder: '100' },
+    { key: 'down_mbps', label: '下行带宽（Mbps）', type: 'number', group: '性能与混淆', min: 1, step: 1, placeholder: '100' },
+    {
+      key: 'obfsType',
+      label: '混淆类型',
+      type: 'select',
+      group: '性能与混淆',
+      options: [
+        { value: '', label: '不启用混淆' },
+        { value: 'salamander', label: 'Salamander' }
+      ]
+    },
+    { key: 'obfsPassword', label: '混淆密码', group: '性能与混淆', required: true, placeholder: 'Salamander 密码', showWhen: { field: 'obfsType', values: ['salamander'] } }
   ],
   tuic: [
-    { key: 'uuid', label: 'UUID' },
-    { key: 'password', label: 'Password' },
-    { key: 'tlsServerName', label: 'SNI' },
-    { key: 'tlsInsecure', label: '允许不安全 TLS', type: 'bool' },
-    { key: 'congestion_control', label: '拥塞控制', defaultValue: 'bbr' },
-    { key: 'alpn', label: 'ALPN(逗号分隔)', defaultValue: 'h3' },
-    { key: 'zero_rtt_handshake', label: '0-RTT', type: 'bool' }
+    { key: 'uuid', label: 'UUID', group: '认证信息', required: true, placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' },
+    { key: 'password', label: '密码', group: '认证信息', required: true, placeholder: 'TUIC 密码' },
+    { key: 'tlsServerName', label: 'SNI', group: 'TLS 设置', placeholder: 'front.example.com' },
+    { key: 'tlsInsecure', label: '跳过证书验证', type: 'bool', group: 'TLS 设置' },
+    { key: 'tlsAlpn', label: 'ALPN', group: 'TLS 设置', defaultValue: 'h3', placeholder: 'h3', help: '多个值用逗号分隔。' },
+    {
+      key: 'congestion_control',
+      label: '拥塞控制',
+      type: 'select',
+      group: '连接设置',
+      defaultValue: 'bbr',
+      options: ['bbr', 'cubic', 'new_reno']
+    },
+    {
+      key: 'udp_relay_mode',
+      label: 'UDP 转发模式',
+      type: 'select',
+      group: '连接设置',
+      defaultValue: 'native',
+      options: [
+        { value: 'native', label: 'native' },
+        { value: 'quic', label: 'quic' }
+      ]
+    },
+    { key: 'zero_rtt_handshake', label: '启用 0-RTT', type: 'bool', group: '连接设置' }
   ]
 };
 
@@ -88,11 +245,11 @@ function renderImportTabs() {
     for (const key of Object.keys(FORM_PROTOCOLS)) {
       const option = document.createElement('option');
       option.value = key;
-      option.textContent = key;
+      option.textContent = PROTOCOL_LABELS[key] || key;
       formTypeEl.appendChild(option);
     }
     formTypeEl.value = 'vless';
-    formPortEl.value = '443';
+    setDefaultFormPort('vless');
   }
 }
 
@@ -106,18 +263,85 @@ function setTab(tab) {
   document.getElementById('node-import-raw-panel').classList.toggle('is-active', !isForm);
 }
 
-function renderFormFields() {
+function renderFormFields({ resetPort = false } = {}) {
   const type = formTypeEl.value || 'vless';
   const fields = FORM_PROTOCOLS[type] || [];
-  formFieldsEl.innerHTML = fields.map((field) => `
-    <label>
-      <span>${escapeHtml(field.label)}</span>
-      ${field.type === 'bool'
-        ? `<select data-manual-field="${escapeHtml(field.key)}"><option value="false">否</option><option value="true">是</option></select>`
-        : `<input data-manual-field="${escapeHtml(field.key)}" value="${escapeHtml(field.defaultValue || '')}" />`}
+  let currentGroup = '';
+  const content = [];
+  for (const field of fields) {
+    if (field.group && field.group !== currentGroup) {
+      currentGroup = field.group;
+      content.push(`<div class="manual-form-group-heading"><span>${escapeHtml(currentGroup)}</span></div>`);
+    }
+    content.push(renderManualField(type, field));
+  }
+  formFieldsEl.innerHTML = content.join('');
+  if (resetPort || !formPortEl.value) {
+    setDefaultFormPort(type);
+  }
+  updateConditionalFields();
+}
+
+function renderManualField(type, field) {
+  const value = field.defaultValue ?? '';
+  const requiredMark = field.required ? '<b class="required-mark" aria-hidden="true">*</b>' : '';
+  const help = field.help ? `<small class="field-help">${escapeHtml(field.help)}</small>` : '';
+  const showWhenAttrs = field.showWhen
+    ? ` data-show-when-field="${escapeHtmlAttr(field.showWhen.field)}" data-show-when-values="${escapeHtmlAttr(field.showWhen.values.join(','))}"`
+    : '';
+  const commonAttrs = [
+    `data-manual-field="${escapeHtmlAttr(field.key)}"`,
+    field.required ? 'required' : '',
+    field.placeholder ? `placeholder="${escapeHtmlAttr(field.placeholder)}"` : '',
+    field.min !== undefined ? `min="${escapeHtmlAttr(field.min)}"` : '',
+    field.max !== undefined ? `max="${escapeHtmlAttr(field.max)}"` : '',
+    field.step !== undefined ? `step="${escapeHtmlAttr(field.step)}"` : '',
+    'autocomplete="off"',
+    'spellcheck="false"'
+  ].filter(Boolean).join(' ');
+
+  let control = '';
+  if (field.type === 'bool') {
+    control = `<select ${commonAttrs}>
+      <option value="false" ${String(value) === 'true' ? '' : 'selected'}>否</option>
+      <option value="true" ${String(value) === 'true' ? 'selected' : ''}>是</option>
+    </select>`;
+  } else if (field.type === 'select') {
+    const options = (field.options || []).map((option) => {
+      const normalized = typeof option === 'object' ? option : { value: option, label: option };
+      const selected = String(normalized.value) === String(value) ? ' selected' : '';
+      return `<option value="${escapeHtmlAttr(normalized.value)}"${selected}>${escapeHtml(normalized.label)}</option>`;
+    }).join('');
+    control = `<select ${commonAttrs}>${options}</select>`;
+  } else if (field.type === 'datalist') {
+    const listID = `manual-${type}-${field.key}-options`;
+    const options = (field.options || []).map((option) => `<option value="${escapeHtmlAttr(option)}"></option>`).join('');
+    control = `<input ${commonAttrs} list="${escapeHtmlAttr(listID)}" value="${escapeHtmlAttr(value)}" />
+      <datalist id="${escapeHtmlAttr(listID)}">${options}</datalist>`;
+  } else {
+    const inputType = field.type === 'number' ? 'number' : 'text';
+    control = `<input ${commonAttrs} type="${inputType}" value="${escapeHtmlAttr(value)}" />`;
+  }
+
+  return `
+    <label class="manual-form-field" data-manual-field-wrap="${escapeHtmlAttr(field.key)}"${showWhenAttrs}>
+      <span class="manual-form-field-label">${escapeHtml(field.label)}${requiredMark}</span>
+      ${control}
+      ${help}
     </label>
-  `).join('');
-  formPortEl.value = type === 'socks' ? '1080' : (formPortEl.value || '443');
+  `;
+}
+
+function setDefaultFormPort(type) {
+  formPortEl.value = String(PROTOCOL_DEFAULT_PORTS[type] || 443);
+}
+
+function updateConditionalFields() {
+  for (const wrapper of formFieldsEl.querySelectorAll('[data-show-when-field]')) {
+    const controller = formFieldsEl.querySelector(`[data-manual-field="${wrapper.dataset.showWhenField}"]`);
+    const allowedValues = String(wrapper.dataset.showWhenValues || '').split(',');
+    wrapper.classList.toggle('is-hidden', !controller || !allowedValues.includes(controller.value));
+  }
 }
 
 function renderNodeList() {
@@ -186,58 +410,158 @@ function renderImportResult(result) {
 
 function buildFormNode() {
   const type = formTypeEl.value;
+  const serverPort = Number(formPortEl.value);
   const node = {
     type,
     tag: formTagEl.value.trim(),
     server: formServerEl.value.trim(),
-    server_port: Number(formPortEl.value || 0)
+    server_port: serverPort
   };
 
-  for (const fieldEl of formFieldsEl.querySelectorAll('[data-manual-field]')) {
-    const key = fieldEl.dataset.manualField;
-    const rawValue = fieldEl.value;
-    const value = rawValue.trim();
-    if (!value) continue;
-    if (key === 'tlsServerName') {
-      node.tls = {
-        enabled: true,
-        server_name: value,
-        insecure: false
-      };
-      continue;
-    }
-    if (key === 'tlsInsecure') {
-      node.tls = node.tls || { enabled: true, server_name: node.server || '', insecure: false };
-      node.tls.insecure = value === 'true';
-      continue;
-    }
-    if (key === 'obfsType') {
-      node.obfs = node.obfs || {};
-      node.obfs.type = value;
-      continue;
-    }
-    if (key === 'obfsPassword') {
-      node.obfs = node.obfs || {};
-      node.obfs.password = value;
-      continue;
-    }
-    if (key === 'alpn') {
-      node.tls = node.tls || { enabled: true, server_name: node.server || '', insecure: false };
-      node.tls.alpn = value.split(',').map((item) => item.trim()).filter(Boolean);
-      continue;
-    }
-    if (key === 'zero_rtt_handshake') {
-      node.zero_rtt_handshake = value === 'true';
-      continue;
-    }
-    node[key] = key === 'alter_id' ? Number(value) : value;
-  }
-
-  if (!node.tag || !node.server || !node.server_port) {
+  if (!node.tag || !node.server || !Number.isInteger(serverPort) || serverPort < 1 || serverPort > 65535) {
     throw new Error('表单节点至少需要名称、服务器和端口');
   }
 
+  const fields = FORM_PROTOCOLS[type] || [];
+  const values = {};
+  for (const field of fields) {
+    const fieldEl = formFieldsEl.querySelector(`[data-manual-field="${field.key}"]`);
+    const wrapper = fieldEl?.closest('[data-manual-field-wrap]');
+    if (!fieldEl || wrapper?.classList.contains('is-hidden')) continue;
+
+    const value = String(fieldEl.value || '').trim();
+    if (!value) {
+      if (field.required) {
+        throw new Error(`${field.label}不能为空`);
+      }
+      continue;
+    }
+
+    if (field.type === 'bool') {
+      values[field.key] = value === 'true';
+      continue;
+    }
+    if (field.type === 'number') {
+      const numberValue = Number(value);
+      if (!Number.isFinite(numberValue) || (field.step === 1 && !Number.isInteger(numberValue))) {
+        throw new Error(`${field.label}必须是有效数字`);
+      }
+      if (field.min !== undefined && numberValue < field.min) {
+        throw new Error(`${field.label}不能小于 ${field.min}`);
+      }
+      if (field.max !== undefined && numberValue > field.max) {
+        throw new Error(`${field.label}不能大于 ${field.max}`);
+      }
+      values[field.key] = numberValue;
+      continue;
+    }
+    values[field.key] = value;
+  }
+
+  const specialFields = new Set([
+    'tlsMode',
+    'tlsServerName',
+    'tlsInsecure',
+    'tlsFingerprint',
+    'realityPublicKey',
+    'realityShortID',
+    'tlsAlpn',
+    'serverPorts',
+    'obfsType',
+    'obfsPassword',
+    'transportType',
+    'transportHost',
+    'transportPath',
+    'grpcServiceName'
+  ]);
+  for (const field of fields) {
+    if (!specialFields.has(field.key) && values[field.key] !== undefined) {
+      node[field.key] = values[field.key];
+    }
+  }
+
+  const tlsRequired = ['trojan', 'hysteria2', 'tuic'].includes(type);
+  const tlsMode = values.tlsMode || (tlsRequired ? 'tls' : 'none');
+  if (tlsMode === 'reality' && !values.tlsFingerprint) {
+    throw new Error('Reality 必须选择 TLS 指纹');
+  }
+  if (tlsMode !== 'none') {
+    const tls = {
+      enabled: true,
+      server_name: values.tlsServerName || node.server,
+      insecure: Boolean(values.tlsInsecure)
+    };
+    if (values.tlsAlpn) {
+      tls.alpn = splitCommaSeparatedValues(values.tlsAlpn);
+    }
+    if (values.tlsFingerprint && !['hysteria2', 'tuic'].includes(type)) {
+      tls.utls = {
+        enabled: true,
+        fingerprint: values.tlsFingerprint
+      };
+    }
+    if (tlsMode === 'reality') {
+      tls.reality = {
+        enabled: true,
+        public_key: values.realityPublicKey
+      };
+      if (values.realityShortID) {
+        tls.reality.short_id = values.realityShortID;
+      }
+    }
+    node.tls = tls;
+  }
+
+  if (values.serverPorts) {
+    node.server_ports = parseServerPorts(values.serverPorts);
+  }
+
+  if (values.obfsType) {
+    node.obfs = { type: values.obfsType };
+    if (values.obfsPassword) {
+      node.obfs.password = values.obfsPassword;
+    }
+  }
+
+  if (values.transportType && values.transportType !== 'tcp') {
+    const transport = { type: values.transportType };
+    if (values.transportType === 'ws') {
+      transport.path = values.transportPath || '/';
+      if (values.transportHost) {
+        transport.headers = { Host: values.transportHost };
+      }
+    } else if (values.transportType === 'http') {
+      transport.path = values.transportPath || '/';
+      if (values.transportHost) {
+        transport.host = [values.transportHost];
+      }
+    } else if (values.transportType === 'grpc' && values.grpcServiceName) {
+      transport.service_name = values.grpcServiceName;
+    }
+    node.transport = transport;
+  }
+
   return node;
+}
+
+function splitCommaSeparatedValues(value) {
+  return String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function parseServerPorts(value) {
+  return splitCommaSeparatedValues(value).map((item) => {
+    const normalized = item.replace(/^(\d+)\s*-\s*(\d+)$/, '$1:$2');
+    const match = normalized.match(/^(\d+)(?::(\d+))?$/);
+    if (!match) {
+      throw new Error(`端口跳跃格式无效：${item}`);
+    }
+    const start = Number(match[1]);
+    const end = Number(match[2] || match[1]);
+    if (start < 1 || start > 65535 || end < 1 || end > 65535 || start > end) {
+      throw new Error(`端口跳跃范围无效：${item}`);
+    }
+    return `${start}:${end}`;
+  });
 }
 
 function setStatus(message, kind = 'idle') {
@@ -264,7 +588,12 @@ document.getElementById('back-nodes').addEventListener('click', () => {
 
 document.getElementById('node-import-tab-form').addEventListener('click', () => setTab('form'));
 document.getElementById('node-import-tab-raw').addEventListener('click', () => setTab('raw'));
-formTypeEl.addEventListener('change', () => renderFormFields());
+formTypeEl.addEventListener('change', () => renderFormFields({ resetPort: true }));
+formFieldsEl.addEventListener('change', (event) => {
+  if (event.target instanceof HTMLElement && event.target.dataset.manualField) {
+    updateConditionalFields();
+  }
+});
 
 document.getElementById('add-manual-form-node').addEventListener('click', () => {
   try {

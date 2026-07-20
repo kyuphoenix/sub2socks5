@@ -709,23 +709,23 @@ func (a *App) handleNodesCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	urlToTest := mustStr(body["url"])
-	if urlToTest == "" {
-		urlToTest = "https://www.gstatic.com/generate_204"
-	}
+	testURLs := proxyDelayCandidateURLs(urlToTest)
 	timeout := int(toFloat(body["timeoutMs"]))
 	if timeout <= 0 {
 		timeout = 5000
 	}
 	results := map[string]any{}
 	for _, tag := range tags {
-		delay, err := measureProxyDelay(tag, urlToTest, timeout)
+		delay, usedURL, err := firstSuccessfulProxyDelay(testURLs, func(testURL string) (int, error) {
+			return measureProxyDelay(tag, testURL, timeout)
+		})
 		if err != nil {
 			results[tag] = map[string]any{"ok": false, "text": "失败", "error": err.Error(), "checkedAt": time.Now().Format(time.RFC3339), "checkedTag": tag}
 			continue
 		}
-		results[tag] = map[string]any{"ok": true, "delay": delay, "text": fmt.Sprintf("%d ms", delay), "checkedAt": time.Now().Format(time.RFC3339), "checkedTag": tag}
+		results[tag] = map[string]any{"ok": true, "delay": delay, "text": fmt.Sprintf("%d ms", delay), "url": usedURL, "checkedAt": time.Now().Format(time.RFC3339), "checkedTag": tag}
 	}
-	ok(w, map[string]any{"ok": true, "url": urlToTest, "timeoutMs": timeout, "results": results})
+	ok(w, map[string]any{"ok": true, "url": testURLs[0], "urls": testURLs, "timeoutMs": timeout, "results": results})
 }
 
 func (a *App) handleNextPort(w http.ResponseWriter, r *http.Request) {
@@ -1273,11 +1273,11 @@ func measureProxyDelay(tag, testURL string, timeoutMs int) (int, error) {
 		msg := strings.ToLower(err.Error())
 		switch {
 		case strings.Contains(msg, "connection refused"):
-			return 0, fmt.Errorf("测速控制接口未就绪（connection refused），请先确认 sing-box 已正常启动")
+			return 0, fmt.Errorf("延迟测试控制接口未就绪（connection refused），请先确认 sing-box 已正常启动")
 		case strings.Contains(msg, "timeout"):
-			return 0, fmt.Errorf("测速控制接口请求超时，请稍后重试")
+			return 0, fmt.Errorf("延迟测试控制接口请求超时，请稍后重试")
 		default:
-			return 0, fmt.Errorf("测速控制接口未就绪，请先确认 sing-box 已正常启动")
+			return 0, fmt.Errorf("延迟测试控制接口未就绪，请先确认 sing-box 已正常启动")
 		}
 	}
 	defer resp.Body.Close()
@@ -1298,6 +1298,35 @@ func measureProxyDelay(tag, testURL string, timeoutMs int) (int, error) {
 		return 0, fmt.Errorf("No delay data")
 	}
 	return delay, nil
+}
+
+var defaultProxyDelayURLs = []string{
+	"https://www.gstatic.com/generate_204",
+	"https://www.google.com/generate_204",
+	"https://cp.cloudflare.com/generate_204",
+}
+
+func proxyDelayCandidateURLs(requestedURL string) []string {
+	requestedURL = strings.TrimSpace(requestedURL)
+	if requestedURL != "" {
+		return []string{requestedURL}
+	}
+	return append([]string(nil), defaultProxyDelayURLs...)
+}
+
+func firstSuccessfulProxyDelay(testURLs []string, measure func(testURL string) (int, error)) (int, string, error) {
+	errorsByURL := make([]string, 0, len(testURLs))
+	for _, testURL := range testURLs {
+		delay, err := measure(testURL)
+		if err == nil {
+			return delay, testURL, nil
+		}
+		errorsByURL = append(errorsByURL, fmt.Sprintf("%s: %v", testURL, err))
+	}
+	if len(errorsByURL) == 0 {
+		return 0, "", fmt.Errorf("没有可用的延迟测试地址")
+	}
+	return 0, "", fmt.Errorf("所有延迟测试地址均失败：%s", strings.Join(errorsByURL, "; "))
 }
 
 func (a *App) handleNodesEgress(w http.ResponseWriter, r *http.Request) {

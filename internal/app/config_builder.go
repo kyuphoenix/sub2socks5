@@ -81,6 +81,7 @@ func cloneMap(in map[string]any) map[string]any {
 
 func collectOutbounds(cfg, sub map[string]any) []any {
 	nr := getMap(cfg, "nodeRegistry")
+	disabledSubscriptionTags := toStringSet(getSlice(nr, "disabledSubscriptionTags"))
 	groups := []any{}
 	for _, g := range getSlice(nr, "groups") {
 		if m, ok := g.(map[string]any); ok {
@@ -102,6 +103,9 @@ func collectOutbounds(cfg, sub map[string]any) []any {
 	subscriptionNodes := []any{}
 	for _, n := range getSlice(sub, "nodes") {
 		if m, ok := n.(map[string]any); ok {
+			if disabledSubscriptionTags[mustStr(m["tag"])] {
+				continue
+			}
 			subscriptionNodes = append(subscriptionNodes, map[string]any{"tag": mustStr(m["tag"]), "type": mustStr(m["type"]), "source": "subscription", "label": fmt.Sprintf("%s（%s / 订阅）", mustStr(m["tag"]), mustStr(m["type"]))})
 		}
 	}
@@ -114,8 +118,15 @@ func collectOutbounds(cfg, sub map[string]any) []any {
 }
 func buildSingBoxConfig(cfg, sub map[string]any) map[string]any {
 	nr := getMap(cfg, "nodeRegistry")
+	disabledSubscriptionTags := toStringSet(getSlice(nr, "disabledSubscriptionTags"))
 	nodes := []any{}
-	nodes = append(nodes, getSlice(sub, "nodes")...)
+	for _, n := range getSlice(sub, "nodes") {
+		m, ok := n.(map[string]any)
+		if !ok || disabledSubscriptionTags[mustStr(m["tag"])] {
+			continue
+		}
+		nodes = append(nodes, m)
+	}
 	nodes = append(nodes, getSlice(nr, "manualNodes")...)
 
 	outbounds := []any{map[string]any{"type": "direct", "tag": "direct"}, map[string]any{"type": "block", "tag": "block"}}

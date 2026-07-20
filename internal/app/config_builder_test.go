@@ -170,3 +170,68 @@ func TestCollectOutbounds_BasicPresence(t *testing.T) {
 		}
 	}
 }
+
+func TestCollectOutbounds_ExcludesDisabledSubscriptionNodes(t *testing.T) {
+	cfg := map[string]any{
+		"nodeRegistry": map[string]any{
+			"disabledSubscriptionTags": []any{"sub-disabled"},
+		},
+	}
+	sub := map[string]any{
+		"nodes": []any{
+			map[string]any{"tag": "sub-active", "type": "trojan"},
+			map[string]any{"tag": "sub-disabled", "type": "trojan"},
+		},
+	}
+
+	out := collectOutbounds(cfg, sub)
+	tags := map[string]bool{}
+	for _, item := range out {
+		m, ok := item.(map[string]any)
+		if ok {
+			tags[mustStr(m["tag"])] = true
+		}
+	}
+	if !tags["sub-active"] {
+		t.Fatalf("active subscription node should remain available")
+	}
+	if tags["sub-disabled"] {
+		t.Fatalf("disabled subscription node should not be available")
+	}
+}
+
+func TestBuildSingBoxConfig_ExcludesDisabledSubscriptionNodes(t *testing.T) {
+	cfg := map[string]any{
+		"app":     map[string]any{"logLevel": "info"},
+		"dns":     map[string]any{"strategy": "prefer_ipv4", "bootstrapServer": "1.1.1.1"},
+		"routing": map[string]any{"routeFinal": "proxy"},
+		"nodeRegistry": map[string]any{
+			"disabledSubscriptionTags": []any{"sub-disabled"},
+			"manualNodes":              []any{},
+			"groups":                   []any{},
+			"chains":                   []any{},
+		},
+		"ports": []any{},
+	}
+	sub := map[string]any{
+		"nodes": []any{
+			map[string]any{"tag": "sub-active", "type": "trojan", "server": "active.example.com", "server_port": 443, "password": "secret"},
+			map[string]any{"tag": "sub-disabled", "type": "trojan", "server": "disabled.example.com", "server_port": 443, "password": "secret"},
+		},
+	}
+
+	generated := buildSingBoxConfig(cfg, sub)
+	tags := map[string]bool{}
+	for _, item := range getSlice(generated, "outbounds") {
+		m, ok := item.(map[string]any)
+		if ok {
+			tags[mustStr(m["tag"])] = true
+		}
+	}
+	if !tags["sub-active"] {
+		t.Fatalf("active subscription node should remain in sing-box config")
+	}
+	if tags["sub-disabled"] {
+		t.Fatalf("disabled subscription node should not remain in sing-box config")
+	}
+}

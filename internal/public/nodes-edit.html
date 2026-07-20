@@ -31,27 +31,29 @@
           <button id="node-import-tab-raw" type="button" class="tab-button">单行/json</button>
         </div>
 
-        <div id="node-import-form-panel" class="tab-panel is-active">
-          <div class="form-grid">
-            <label>
-              <span>协议</span>
+        <div id="node-import-form-panel" class="tab-panel manual-form-panel is-active">
+          <p class="manual-form-intro">选择协议后填写必要参数；带 <b class="required-mark">*</b> 的项目必须填写。高级字段会按 TLS 和传输方式自动显示。</p>
+          <div class="form-grid manual-form-grid">
+            <label class="manual-form-field">
+              <span class="manual-form-field-label">协议<b class="required-mark">*</b></span>
               <select id="manual-form-type"></select>
             </label>
-            <label>
-              <span>节点名称</span>
-              <input id="manual-form-tag" />
+            <label class="manual-form-field">
+              <span class="manual-form-field-label">节点名称<b class="required-mark">*</b></span>
+              <input id="manual-form-tag" autocomplete="off" spellcheck="false" placeholder="例如 香港-手动-01" />
+              <small class="field-help">名称需要唯一，保存后会作为节点 tag 使用。</small>
             </label>
-            <label>
-              <span>服务器地址</span>
-              <input id="manual-form-server" />
+            <label class="manual-form-field">
+              <span class="manual-form-field-label">服务器地址<b class="required-mark">*</b></span>
+              <input id="manual-form-server" autocomplete="off" spellcheck="false" placeholder="域名、IPv4 或 IPv6" />
             </label>
-            <label>
-              <span>端口</span>
-              <input id="manual-form-port" type="number" min="1" max="65535" />
+            <label class="manual-form-field">
+              <span class="manual-form-field-label">端口<b class="required-mark">*</b></span>
+              <input id="manual-form-port" type="number" min="1" max="65535" step="1" inputmode="numeric" />
             </label>
           </div>
-          <div id="manual-form-fields" class="form-grid" style="margin-top: 12px;"></div>
-          <div class="section-heading-actions" style="margin-top: 12px;">
+          <div id="manual-form-fields" class="form-grid manual-form-grid manual-form-fields"></div>
+          <div class="section-heading-actions manual-form-actions">
             <button id="add-manual-form-node" type="button">添加表单节点</button>
           </div>
         </div>

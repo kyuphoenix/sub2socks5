@@ -481,6 +481,9 @@ func parseNodeLine(line string) (map[string]any, error) {
 			if tls := buildTLSFromURL(u); tls != nil {
 				node["tls"] = tls
 			}
+			if serverPorts := parseHysteria2ServerPorts(firstNonEmpty(u.Query().Get("mport"), u.Query().Get("ports"), u.Query().Get("server_ports"))); len(serverPorts) > 0 {
+				node["server_ports"] = serverPorts
+			}
 			if up := firstNonEmpty(u.Query().Get("upmbps"), u.Query().Get("up_mbps"), u.Query().Get("up")); strings.TrimSpace(up) != "" {
 				node["up_mbps"] = parseRateMbps(up)
 			}
@@ -586,7 +589,8 @@ func parseNodeLine(line string) (map[string]any, error) {
 func buildTLSFromURL(u *url.URL) map[string]any {
 	q := u.Query()
 	security := strings.TrimSpace(q.Get("security"))
-	isTLS := u.Scheme == "trojan" || q.Get("tls") == "1" || strings.EqualFold(security, "tls") || strings.EqualFold(security, "reality")
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	isTLS := scheme == "trojan" || scheme == "hysteria2" || scheme == "tuic" || q.Get("tls") == "1" || strings.EqualFold(security, "tls") || strings.EqualFold(security, "reality")
 	if !isTLS {
 		return nil
 	}
@@ -596,10 +600,13 @@ func buildTLSFromURL(u *url.URL) map[string]any {
 	}
 	tls := map[string]any{
 		"enabled":     true,
-		"server_name": firstNonEmpty(q.Get("sni"), u.Hostname()),
-		"insecure":    q.Get("allowInsecure") == "1",
+		"server_name": firstNonEmpty(q.Get("sni"), q.Get("peer"), q.Get("servername"), u.Hostname()),
+		"insecure": boolFromAny(q.Get("allowInsecure")) ||
+			boolFromAny(q.Get("insecure")) ||
+			boolFromAny(q.Get("allow_insecure")) ||
+			boolFromAny(q.Get("skip-cert-verify")),
 	}
-	if fingerprint != "" && u.Scheme != "hysteria2" && u.Scheme != "tuic" {
+	if fingerprint != "" && scheme != "hysteria2" && scheme != "tuic" {
 		tls["utls"] = map[string]any{"enabled": true, "fingerprint": fingerprint}
 	}
 	if strings.EqualFold(security, "reality") {
@@ -609,10 +616,33 @@ func buildTLSFromURL(u *url.URL) map[string]any {
 			"short_id":   emptyToNil(q.Get("sid")),
 		}
 	}
-	if u.Scheme == "hysteria2" || u.Scheme == "tuic" {
-		tls["alpn"] = []any{"h3"}
+	if scheme == "hysteria2" || scheme == "tuic" {
+		if alpn := strings.TrimSpace(q.Get("alpn")); alpn != "" {
+			tls["alpn"] = splitCSV(alpn)
+		} else {
+			tls["alpn"] = []any{"h3"}
+		}
 	}
 	return tls
+}
+
+func parseHysteria2ServerPorts(raw string) []any {
+	parts := strings.Split(strings.TrimSpace(raw), ",")
+	ports := make([]any, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "-") && !strings.Contains(part, ":") {
+			part = strings.Replace(part, "-", ":", 1)
+		}
+		if !strings.Contains(part, ":") && strings.IndexFunc(part, func(r rune) bool { return r < '0' || r > '9' }) == -1 {
+			part += ":" + part
+		}
+		ports = append(ports, part)
+	}
+	return ports
 }
 
 func buildTransportFromURL(u *url.URL) map[string]any {
