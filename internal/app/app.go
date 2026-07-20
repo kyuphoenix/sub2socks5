@@ -49,6 +49,7 @@ type App struct {
 	staticFS              fs.FS
 	autoUpdateLastRun     map[string]time.Time
 	autoUpdateLastAttempt map[string]time.Time
+	nodeDelayResults      map[string]any
 }
 
 func Run() error {
@@ -75,6 +76,7 @@ func RunWithStaticFS(staticFS fs.FS) error {
 		downloadState:         map[string]any{"active": false, "steps": []any{}, "progress": nil, "updatedAt": nil},
 		autoUpdateLastRun:     map[string]time.Time{},
 		autoUpdateLastAttempt: map[string]time.Time{},
+		nodeDelayResults:      map[string]any{},
 	}
 	must(os.MkdirAll(app.dataDir, 0o755))
 	must(os.MkdirAll(app.runtimeDir, 0o755))
@@ -99,19 +101,25 @@ func RunWithStaticFS(staticFS fs.FS) error {
 }
 
 const (
-	subscriptionRefreshTimeout           = 90 * time.Second
-	autoUpdateFailureRetryDelay          = 5 * time.Minute
-	maxAPIRequestBodyBytes               = 2 << 20
-	maxKernelArchiveBytes                = 512 << 20
-	kernelDownloadTimeout                = 30 * time.Minute
-	kernelDownloadIdleTimeout            = 2 * time.Minute
-	kernelDownloadProgressInterval       = 250 * time.Millisecond
-	kernelDownloadProgressBytes    int64 = 1 << 20
-	maxRuntimeLogLineBytes               = 16 << 10
-	runtimeLogTruncatedSuffix            = " [truncated]"
-	autoRestartStablePeriod              = 5 * time.Minute
-	maxAutoRestartDelay                  = 30 * time.Second
+	subscriptionRefreshTimeout               = 90 * time.Second
+	autoUpdateFailureRetryDelay              = 5 * time.Minute
+	maxAPIRequestBodyBytes                   = 2 << 20
+	maxKernelArchiveBytes                    = 512 << 20
+	kernelDownloadTimeout                    = 30 * time.Minute
+	kernelDownloadIdleTimeout                = 2 * time.Minute
+	kernelDownloadProgressInterval           = 250 * time.Millisecond
+	kernelDownloadProgressBytes        int64 = 1 << 20
+	maxRuntimeLogLineBytes                   = 16 << 10
+	runtimeLogTruncatedSuffix                = " [truncated]"
+	autoRestartStablePeriod                  = 5 * time.Minute
+	maxAutoRestartDelay                      = 30 * time.Second
+	proxyDelayControllerStartupTimeout       = 6 * time.Second
+	proxyDelayControllerRetryInterval        = 150 * time.Millisecond
+	runtimeDelaySnapshotTimeout              = 3 * time.Second
+	maxClashProxyResponseBytes         int64 = 8 << 20
 )
+
+const clashAPIBaseURL = "http://127.0.0.1:19090"
 
 func newHTTPHandler(app *App) http.Handler {
 	mux := http.NewServeMux()
@@ -120,6 +128,7 @@ func newHTTPHandler(app *App) http.Handler {
 	mux.HandleFunc("/api/nodes", app.handleNodes)
 	mux.HandleFunc("/api/nodes/import", app.handleNodeImport)
 	mux.HandleFunc("/api/nodes/check", app.handleNodesCheck)
+	mux.HandleFunc("/api/nodes/delays", app.handleNodeDelays)
 	mux.HandleFunc("/api/nodes/egress", app.handleNodesEgress)
 	mux.HandleFunc("/api/ports/next", app.handleNextPort)
 	mux.HandleFunc("/api/runtime/generate", app.handleRuntimeGenerate)
@@ -624,6 +633,7 @@ func (a *App) handleNodes(w http.ResponseWriter, r *http.Request) {
 			"chains":                   getSlice(nr, "chains"),
 			"availableOutbounds":       collectOutbounds(a.cfg, a.subState),
 			"fallbackStates":           map[string]any{},
+			"nodeDelays":               nonNilMap(a.nodeDelayResults),
 		})
 		a.mu.RUnlock()
 		if err != nil {
@@ -714,18 +724,66 @@ func (a *App) handleNodesCheck(w http.ResponseWriter, r *http.Request) {
 	if timeout <= 0 {
 		timeout = 5000
 	}
+	readyCtx, cancelReady := context.WithTimeout(r.Context(), proxyDelayControllerStartupTimeout)
+	readyErr := waitForProxyDelayController(readyCtx, proxyDelayControllerRetryInterval, probeProxyDelayController)
+	cancelReady()
+	if readyErr != nil {
+		checkedAt := time.Now().Format(time.RFC3339)
+		results := map[string]any{}
+		for _, tag := range tags {
+			results[tag] = map[string]any{
+				"ok":         false,
+				"text":       "失败",
+				"error":      readyErr.Error(),
+				"checkedAt":  checkedAt,
+				"checkedTag": tag,
+				"source":     "manual",
+			}
+		}
+		a.mergeNodeDelayResults(results)
+		ok(w, map[string]any{"ok": true, "url": testURLs[0], "urls": testURLs, "timeoutMs": timeout, "results": results})
+		return
+	}
 	results := map[string]any{}
 	for _, tag := range tags {
 		delay, usedURL, err := firstSuccessfulProxyDelay(testURLs, func(testURL string) (int, error) {
 			return measureProxyDelay(tag, testURL, timeout)
 		})
 		if err != nil {
-			results[tag] = map[string]any{"ok": false, "text": "失败", "error": err.Error(), "checkedAt": time.Now().Format(time.RFC3339), "checkedTag": tag}
+			results[tag] = map[string]any{"ok": false, "text": "失败", "error": err.Error(), "checkedAt": time.Now().Format(time.RFC3339), "checkedTag": tag, "source": "manual"}
 			continue
 		}
-		results[tag] = map[string]any{"ok": true, "delay": delay, "text": fmt.Sprintf("%d ms", delay), "url": usedURL, "checkedAt": time.Now().Format(time.RFC3339), "checkedTag": tag}
+		results[tag] = map[string]any{"ok": true, "delay": delay, "text": fmt.Sprintf("%d ms", delay), "url": usedURL, "checkedAt": time.Now().Format(time.RFC3339), "checkedTag": tag, "source": "manual"}
 	}
+	a.mergeNodeDelayResults(results)
 	ok(w, map[string]any{"ok": true, "url": testURLs[0], "urls": testURLs, "timeoutMs": timeout, "results": results})
+}
+
+func (a *App) handleNodeDelays(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+
+	a.mu.RLock()
+	running := getBool(a.runtimeInfo, "running", false)
+	cached := cloneMap(nonNilMap(a.nodeDelayResults))
+	a.mu.RUnlock()
+	if !running {
+		ok(w, map[string]any{"ok": true, "running": false, "ready": false, "results": cached})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), runtimeDelaySnapshotTimeout)
+	liveResults, err := fetchClashProxyDelayResults(ctx)
+	cancel()
+	if err != nil {
+		ok(w, map[string]any{"ok": true, "running": true, "ready": false, "results": cached})
+		return
+	}
+
+	results := a.mergeNodeDelayResults(liveResults)
+	ok(w, map[string]any{"ok": true, "running": true, "ready": true, "results": results})
 }
 
 func (a *App) handleNextPort(w http.ResponseWriter, r *http.Request) {
@@ -1265,8 +1323,12 @@ func resolveManagedPath(rootDir, p string) string {
 	return filepath.Join(rootDir, filepath.FromSlash(p))
 }
 
+func buildProxyDelayEndpoint(baseURL, tag, testURL string, timeoutMs int) string {
+	return fmt.Sprintf("%s/proxies/%s/delay?url=%s&timeout=%d", strings.TrimRight(baseURL, "/"), url.PathEscape(tag), url.QueryEscape(testURL), timeoutMs)
+}
+
 func measureProxyDelay(tag, testURL string, timeoutMs int) (int, error) {
-	endpoint := fmt.Sprintf("http://127.0.0.1:19090/proxies/%s/delay?url=%s&timeout=%d", url.QueryEscape(tag), url.QueryEscape(testURL), timeoutMs)
+	endpoint := buildProxyDelayEndpoint(clashAPIBaseURL, tag, testURL, timeoutMs)
 	client := &http.Client{Timeout: time.Duration(timeoutMs+1500) * time.Millisecond}
 	resp, err := client.Get(endpoint)
 	if err != nil {
@@ -1298,6 +1360,191 @@ func measureProxyDelay(tag, testURL string, timeoutMs int) (int, error) {
 		return 0, fmt.Errorf("No delay data")
 	}
 	return delay, nil
+}
+
+func waitForProxyDelayController(ctx context.Context, retryInterval time.Duration, probe func(context.Context) error) error {
+	if retryInterval <= 0 {
+		retryInterval = 100 * time.Millisecond
+	}
+	var lastErr error
+	for {
+		if err := probe(ctx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if lastErr != nil {
+				return fmt.Errorf("延迟测试控制接口启动超时: %w", lastErr)
+			}
+			return fmt.Errorf("延迟测试控制接口启动超时: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func probeProxyDelayController(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, clashAPIBaseURL+"/version", nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func fetchClashProxyDelayResults(ctx context.Context) (map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, clashAPIBaseURL+"/proxies", nil)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: runtimeDelaySnapshotTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("clash api proxies: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxClashProxyResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > maxClashProxyResponseBytes {
+		return nil, fmt.Errorf("clash api proxies response exceeds %d bytes", maxClashProxyResponseBytes)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	return parseClashProxyDelayResults(payload), nil
+}
+
+func parseClashProxyDelayResults(payload map[string]any) map[string]any {
+	results := map[string]any{}
+	for tag, rawProxy := range getMap(payload, "proxies") {
+		proxy, ok := rawProxy.(map[string]any)
+		if !ok {
+			continue
+		}
+		history := getSlice(proxy, "history")
+		if len(history) == 0 {
+			continue
+		}
+		latest, ok := history[len(history)-1].(map[string]any)
+		if !ok {
+			continue
+		}
+		delay := int(toFloat(latest["delay"]))
+		result := map[string]any{
+			"ok":         delay > 0,
+			"delay":      delay,
+			"checkedAt":  mustStr(latest["time"]),
+			"checkedTag": tag,
+			"source":     "runtime",
+		}
+		if delay > 0 {
+			result["text"] = fmt.Sprintf("%d ms", delay)
+		} else {
+			result["text"] = "失败"
+			result["error"] = "sing-box 自动延迟测试失败"
+		}
+		results[tag] = result
+	}
+	return results
+}
+
+func (a *App) mergeNodeDelayResults(results map[string]any) map[string]any {
+	incoming := cloneMap(nonNilMap(results))
+	a.mu.Lock()
+	if a.nodeDelayResults == nil {
+		a.nodeDelayResults = map[string]any{}
+	}
+	allowedTags := a.currentNodeDelayTagsLocked()
+	for tag := range a.nodeDelayResults {
+		if !allowedTags[tag] {
+			delete(a.nodeDelayResults, tag)
+		}
+	}
+	for tag, result := range incoming {
+		if !allowedTags[tag] {
+			continue
+		}
+		if existing, exists := a.nodeDelayResults[tag]; exists && !shouldReplaceNodeDelayResult(existing, result) {
+			continue
+		}
+		a.nodeDelayResults[tag] = result
+	}
+	snapshot := cloneMap(a.nodeDelayResults)
+	a.mu.Unlock()
+	return snapshot
+}
+
+func (a *App) currentNodeDelayTagsLocked() map[string]bool {
+	tags := map[string]bool{}
+	for _, item := range collectOutbounds(a.cfg, a.subState) {
+		outbound, ok := item.(map[string]any)
+		if !ok || mustStr(outbound["source"]) == "builtin" {
+			continue
+		}
+		if tag := strings.TrimSpace(mustStr(outbound["tag"])); tag != "" {
+			tags[tag] = true
+		}
+	}
+	return tags
+}
+
+func shouldReplaceNodeDelayResult(existing, incoming any) bool {
+	existingMap, existingOK := existing.(map[string]any)
+	incomingMap, incomingOK := incoming.(map[string]any)
+	if !incomingOK {
+		return true
+	}
+	incomingTime, incomingTimeOK := parseNodeDelayCheckedAt(mustStr(incomingMap["checkedAt"]))
+	if !existingOK {
+		return true
+	}
+	existingTime, existingTimeOK := parseNodeDelayCheckedAt(mustStr(existingMap["checkedAt"]))
+	switch {
+	case incomingTimeOK && existingTimeOK:
+		return !incomingTime.Before(existingTime)
+	case incomingTimeOK:
+		return true
+	case existingTimeOK:
+		return false
+	default:
+		return true
+	}
+}
+
+func parseNodeDelayCheckedAt(value string) (time.Time, bool) {
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
+	return parsed, err == nil
+}
+
+func nonNilMap(value map[string]any) map[string]any {
+	if value == nil {
+		return map[string]any{}
+	}
+	return value
 }
 
 var defaultProxyDelayURLs = []string{
@@ -1408,7 +1655,7 @@ func pickProxySocksPort(cfg map[string]any) (string, int, error) {
 }
 
 func clashSelectProxy(groupTag, selectedTag string, timeoutMs int) error {
-	endpoint := fmt.Sprintf("http://127.0.0.1:19090/proxies/%s", url.QueryEscape(groupTag))
+	endpoint := fmt.Sprintf("%s/proxies/%s", clashAPIBaseURL, url.PathEscape(groupTag))
 	payload, _ := json.Marshal(map[string]any{"name": selectedTag})
 	req, _ := http.NewRequest(http.MethodPut, endpoint, bytes.NewReader(payload))
 	req.Header.Set("content-type", "application/json")

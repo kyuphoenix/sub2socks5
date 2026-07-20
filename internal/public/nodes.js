@@ -8,6 +8,7 @@ const toggleGroupsSectionButton = document.getElementById('toggle-groups-section
 const toggleChainsSectionButton = document.getElementById('toggle-chains-section');
 const NODES_UPDATED_KEY = 'sub2socks5:nodes-updated-at';
 const CHECK_BATCH_SIZE = 5;
+const AUTO_DELAY_REFRESH_INTERVAL_MS = 3000;
 const GROUP_TEST_URL_PRESETS = [
   'https://www.gstatic.com/generate_204',
   'https://www.google.com/generate_204',
@@ -29,6 +30,7 @@ const expandedGroups = new Set();
 const expandedChains = new Set();
 let groupsSectionCollapsed = false;
 let chainsSectionCollapsed = false;
+let runtimeDelayRefreshInFlight = false;
 
 async function load() {
   const response = await fetch('/api/nodes');
@@ -42,6 +44,7 @@ async function load() {
     chains: Array.isArray(data.chains) ? data.chains : [],
     fallbackStates: data.fallbackStates || {}
   };
+  mergeNodeDelayResults(data.nodeDelays);
   render();
 }
 
@@ -72,6 +75,9 @@ function renderAvailableNodes() {
     const delayState = nodeDelayState[node.tag];
     const isChecking = checkingNodeTags.has(node.tag) || delayState?.loading;
     const delayText = isChecking ? '测试中...' : delayState?.text || '延迟';
+    const delayTitle = delayState?.checkedAt
+      ? `点击重新测试延迟；最近${delayState.source === 'runtime' ? '自动' : '手动'}测试：${delayState.checkedAt}`
+      : '点击测试延迟';
     const card = document.createElement('div');
     card.className = 'node-pill node-pill-checkable';
     card.innerHTML = `
@@ -82,7 +88,7 @@ function renderAvailableNodes() {
           <span class="node-pill-tag is-source">${escapeHtml(sourceLabel(node.source))}</span>
         </div>
       </div>
-      <button type="button" class="node-check-button ${isChecking ? 'is-loading' : ''}" data-check-node="${escapeHtmlAttr(node.tag)}" title="点击测试延迟">${escapeHtml(delayText)}</button>
+      <button type="button" class="node-check-button ${isChecking ? 'is-loading' : ''}" data-check-node="${escapeHtmlAttr(node.tag)}" title="${escapeHtmlAttr(delayTitle)}" ${isChecking ? 'disabled' : ''}>${escapeHtml(delayText)}</button>
     `;
     availableNodeListEl.appendChild(card);
   }
@@ -297,8 +303,10 @@ async function checkNode(tag) {
   checkingNodeTags.add(tag);
   nodeDelayState[tag] = { loading: true, text: '测试中...' };
   renderAvailableNodes();
+  let runtimeStartedForTest = false;
   try {
-    const runtimeWasRunning = await ensureRuntimeRunning();
+    const runtimeState = await prepareRuntimeForDelayTest();
+    runtimeStartedForTest = runtimeState.startedForTest;
     const response = await fetch('/api/nodes/check', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -309,24 +317,21 @@ async function checkNode(tag) {
       throw new Error(data?.error?.message || '延迟测试失败');
     }
     const result = data.results?.[tag];
-    nodeDelayState[tag] = result?.ok
-      ? {
-          text: result.text,
-          checkedAt: result.checkedAt,
-          checkedTag: result.checkedTag
-        }
-      : { text: '失败', error: result?.error || '延迟测试失败' };
-    setStatus(`节点 ${tag} 延迟测试完成`, 'success');
-    if (!runtimeWasRunning) {
-      await stopRuntime();
+    nodeDelayState[tag] = normalizeNodeDelayResult(result);
+    if (result?.ok) {
+      setStatus(`节点 ${tag} 延迟测试完成`, 'success');
+    } else {
+      setStatus(`节点 ${tag} 延迟测试失败：${result?.error || '未知错误'}`, 'error');
     }
   } catch (error) {
     nodeDelayState[tag] = { text: '失败', error: error.message };
     setStatus(error.message, 'error');
-    try {
-      await stopRuntimeIfNeeded();
-    } catch {}
   } finally {
+    if (runtimeStartedForTest) {
+      try {
+        await stopRuntime();
+      } catch {}
+    }
     checkingNodeTags.delete(tag);
     renderAvailableNodes();
   }
@@ -339,15 +344,17 @@ async function checkAllNodes() {
     return;
   }
 
-  const runtimeWasRunning = await ensureRuntimeRunning();
-  setStatus('正在分批测试全部节点延迟...', 'loading');
-  for (const tag of tags) {
-    nodeDelayState[tag] = { loading: true, text: '测试中...' };
-  }
-  renderAvailableNodes();
-
   let hasError = false;
+  let runtimeStartedForTest = false;
   try {
+    const runtimeState = await prepareRuntimeForDelayTest();
+    runtimeStartedForTest = runtimeState.startedForTest;
+    setStatus('正在分批测试全部节点延迟...', 'loading');
+    for (const tag of tags) {
+      nodeDelayState[tag] = { loading: true, text: '测试中...' };
+    }
+    renderAvailableNodes();
+
     for (let index = 0; index < tags.length; index += CHECK_BATCH_SIZE) {
       const batch = tags.slice(index, index + CHECK_BATCH_SIZE);
       const response = await fetch('/api/nodes/check', {
@@ -361,9 +368,7 @@ async function checkAllNodes() {
       }
       for (const tag of batch) {
         const result = data.results?.[tag];
-        nodeDelayState[tag] = result?.ok
-          ? { text: result.text, checkedAt: result.checkedAt, checkedTag: result.checkedTag }
-          : { text: '失败', error: result?.error || '延迟测试失败' };
+        nodeDelayState[tag] = normalizeNodeDelayResult(result);
         if (!result?.ok) hasError = true;
       }
       renderAvailableNodes();
@@ -372,8 +377,10 @@ async function checkAllNodes() {
     hasError = true;
     setStatus(error.message, 'error');
   } finally {
-    if (!runtimeWasRunning) {
-      await stopRuntime();
+    if (runtimeStartedForTest) {
+      try {
+        await stopRuntime();
+      } catch {}
     }
   }
 
@@ -384,26 +391,35 @@ async function checkAllNodes() {
   setStatus('全部节点延迟测试完成', 'success');
 }
 
-async function ensureRuntimeRunning() {
+async function prepareRuntimeForDelayTest() {
   const configResponse = await fetch('/api/config');
   const configData = await configResponse.json();
   if (!configResponse.ok) {
     throw new Error(configData?.error?.message || '读取运行状态失败');
   }
   const runtimeWasRunning = Boolean(configData?.runtime?.running);
-  if (!runtimeWasRunning) {
-    const startResponse = await fetch('/api/runtime/start', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: '{}'
-    });
-    const startData = await startResponse.json();
-    if (!startResponse.ok) {
-      throw new Error(startData?.error?.message || '启动 sing-box 失败');
-    }
-    await waitForRuntimeReady();
+  if (runtimeWasRunning) {
+    return { runtimeWasRunning: true, startedForTest: false };
   }
-  return runtimeWasRunning;
+
+  const startResponse = await fetch('/api/runtime/start', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}'
+  });
+  const startData = await startResponse.json();
+  if (!startResponse.ok) {
+    throw new Error(startData?.error?.message || '启动 sing-box 失败');
+  }
+  try {
+    await waitForRuntimeReady();
+  } catch (error) {
+    try {
+      await stopRuntime();
+    } catch {}
+    throw error;
+  }
+  return { runtimeWasRunning: false, startedForTest: true };
 }
 
 async function stopRuntime() {
@@ -414,27 +430,64 @@ async function stopRuntime() {
   });
 }
 
-async function stopRuntimeIfNeeded() {
-  const response = await fetch('/api/config');
-  const data = await response.json();
-  if (!response.ok) return;
-  if (data?.runtime?.running) {
-    await stopRuntime();
-  }
-}
-
-async function waitForRuntimeReady(timeoutMs = 8000) {
+async function waitForRuntimeReady(timeoutMs = 10000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    const response = await fetch('/api/config');
-    const data = await response.json();
-    if (response.ok && data?.runtime?.running) {
-      await sleep(700);
+    const [configResponse, delayResponse] = await Promise.all([
+      fetch('/api/config'),
+      fetch('/api/nodes/delays')
+    ]);
+    const configData = await configResponse.json();
+    const delayData = await delayResponse.json();
+    if (configResponse.ok && configData?.runtime?.running && delayResponse.ok && delayData?.ready) {
       return;
     }
     await sleep(250);
   }
   throw new Error('sing-box 启动超时，请检查内核日志');
+}
+
+function normalizeNodeDelayResult(result) {
+  if (result?.ok) {
+    return {
+      text: result.text || `${result.delay} ms`,
+      delay: result.delay,
+      checkedAt: result.checkedAt,
+      checkedTag: result.checkedTag,
+      source: result.source || 'manual'
+    };
+  }
+  return {
+    text: '失败',
+    checkedAt: result?.checkedAt,
+    checkedTag: result?.checkedTag,
+    source: result?.source || 'manual',
+    error: result?.error || '延迟测试失败'
+  };
+}
+
+function mergeNodeDelayResults(results) {
+  if (!results || typeof results !== 'object') return;
+  for (const [tag, result] of Object.entries(results)) {
+    if (checkingNodeTags.has(tag) || nodeDelayState[tag]?.loading) continue;
+    nodeDelayState[tag] = normalizeNodeDelayResult(result);
+  }
+}
+
+async function refreshRuntimeDelays() {
+  if (runtimeDelayRefreshInFlight || document.hidden) return;
+  runtimeDelayRefreshInFlight = true;
+  try {
+    const response = await fetch('/api/nodes/delays');
+    const data = await response.json();
+    if (!response.ok) return;
+    mergeNodeDelayResults(data.results);
+    renderAvailableNodes();
+  } catch {
+    // 运行时停止或控制接口重启期间保留最后一次成功结果。
+  } finally {
+    runtimeDelayRefreshInFlight = false;
+  }
 }
 
 function sleep(ms) {
@@ -634,7 +687,16 @@ document.addEventListener('click', (event) => {
   }
 });
 
-load().catch((error) => setStatus(error.message, 'error'));
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    refreshRuntimeDelays();
+  }
+});
+
+load()
+  .then(() => refreshRuntimeDelays())
+  .catch((error) => setStatus(error.message, 'error'));
+window.setInterval(refreshRuntimeDelays, AUTO_DELAY_REFRESH_INTERVAL_MS);
 
 function findDuplicateTag(items) {
   const seen = new Set();

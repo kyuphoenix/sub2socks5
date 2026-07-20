@@ -585,10 +585,11 @@ button:disabled {
 .node-check-button:hover,
 .icon-button:hover,
 .sub-url-zoom:hover {
-  cursor: not-allowed;
+  cursor: pointer;
 }
 .node-check-button.is-loading {
   opacity: 0.8;
+  cursor: wait;
 }
 .split-layout {
   display: grid;
