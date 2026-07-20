@@ -2,15 +2,18 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f0f2f5" />
   <title>sub2socks5</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <main class="container">
-    <div id="toast-container" style="position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:9999;display:none;align-items:center;gap:8px;padding:12px 20px;border-radius:10px;background:#fff;box-shadow:0 4px 16px rgba(0,0,0,0.15);font-size:15px;font-weight:500;pointer-events:none"></div>
-    <h1>sub2socks5</h1>
-    <p>订阅转多端口 socks5 管理面板</p>
+    <div id="toast-container" class="toast-container" role="status" aria-live="polite"></div>
+    <header class="app-hero">
+      <h1>sub2socks5</h1>
+      <p>订阅转多端口 SOCKS5 管理面板</p>
+    </header>
 
     <section>
       <div id="status-bar" class="status-bar is-idle">准备就绪</div>

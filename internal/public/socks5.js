@@ -66,14 +66,14 @@ function render() {
   }
   for (const [index, portItem] of formPorts.entries()) {
     const item = document.createElement('div');
-    item.className = 'timeline-item';
+    item.className = 'timeline-item socks-service-card';
     item.innerHTML = `
-      <div style="max-width:500px">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-          <div class="title" style="margin:0">SOCKS5 服务 ${index + 1}</div>
-          <button type="button" data-copy-port="${index}" style="min-width:auto;padding:4px 10px;font-size:13px;background:#e5e7eb;color:#1a1a2e;border-radius:6px">复制</button>
+      <div class="socks-service-content">
+        <div class="socks-service-card-heading">
+          <div class="title">SOCKS5 服务 ${index + 1}</div>
+          <button type="button" class="copy-service-button" data-copy-port="${index}">复制</button>
         </div>
-        <div class="form-grid" style="grid-template-columns:1fr 1fr">
+        <div class="form-grid socks-service-grid">
           <label>
             <span>监听地址</span>
             <input data-port-index="${index}" data-port-field="listen" value="${escapeHtmlAttr(portItem.listen || '127.0.0.1')}" />
@@ -82,14 +82,14 @@ function render() {
             <span>端口</span>
             <input data-port-index="${index}" data-port-field="port" type="number" min="1" step="1" value="${escapeHtmlAttr(String(portItem.port || ''))}" />
           </label>
-          <label style="grid-column:1">
+          <label class="socks-target-field">
             <span>目标出口</span>
             <select data-port-index="${index}" data-port-field="target">
               ${buildOutboundOptionsHtml(portItem.target)}
             </select>
           </label>
-          <div style="grid-column:2;display:flex;align-items:flex-end;justify-content:flex-end">
-            ${formPorts.length > 1 ? `<button type="button" data-remove-port="${index}" style="background:#ef4444;white-space:nowrap">删除</button>` : ''}
+          <div class="socks-remove-action">
+            ${formPorts.length > 1 ? `<button type="button" class="danger-button" data-remove-port="${index}">删除</button>` : ''}
           </div>
         </div>
       </div>
