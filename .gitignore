@@ -5,3 +5,5 @@ dist
 internal/data/
 internal/runtime/
 internal/bin
+docs/superpower/
+docs/diagnostics/
