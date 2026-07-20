@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -28,23 +29,26 @@ import (
 )
 
 type App struct {
-	mu                  sync.RWMutex
-	cfg                 map[string]any
-	subState            map[string]any
-	runtimeInfo         map[string]any
-	proc                *exec.Cmd
-	manualStopRequested bool
-	autoRestartAttempts int
-	plannedKernel       map[string]any
-	releaseList         []any
-	downloadState       map[string]any
-	rootDir             string
-	dataDir             string
-	runtimeDir          string
-	binDir              string
-	publicDir           string
-	staticFS            fs.FS
-	autoUpdateLastRun   map[string]time.Time
+	mu                    sync.RWMutex
+	subscriptionRefreshMu sync.Mutex
+	cfg                   map[string]any
+	subState              map[string]any
+	runtimeInfo           map[string]any
+	proc                  *exec.Cmd
+	manualStopRequested   bool
+	autoRestartAttempts   int
+	runtimeStartedAt      time.Time
+	plannedKernel         map[string]any
+	releaseList           []any
+	downloadState         map[string]any
+	rootDir               string
+	dataDir               string
+	runtimeDir            string
+	binDir                string
+	publicDir             string
+	staticFS              fs.FS
+	autoUpdateLastRun     map[string]time.Time
+	autoUpdateLastAttempt map[string]time.Time
 }
 
 func Run() error {
@@ -66,10 +70,11 @@ func RunWithStaticFS(staticFS fs.FS) error {
 			"running": false,
 			"logs":    []string{},
 		},
-		plannedKernel:     nil,
-		releaseList:       []any{},
-		downloadState:     map[string]any{"active": false, "steps": []any{}, "progress": nil, "updatedAt": nil},
-		autoUpdateLastRun: map[string]time.Time{},
+		plannedKernel:         nil,
+		releaseList:           []any{},
+		downloadState:         map[string]any{"active": false, "steps": []any{}, "progress": nil, "updatedAt": nil},
+		autoUpdateLastRun:     map[string]time.Time{},
+		autoUpdateLastAttempt: map[string]time.Time{},
 	}
 	must(os.MkdirAll(app.dataDir, 0o755))
 	must(os.MkdirAll(app.runtimeDir, 0o755))
@@ -86,6 +91,29 @@ func RunWithStaticFS(staticFS fs.FS) error {
 
 	go app.runSubscriptionAutoUpdateScheduler()
 
+	host := getString(getMap(app.cfg, "app"), "host", "0.0.0.0")
+	port := getInt(getMap(app.cfg, "app"), "port", 18080)
+	addr := fmt.Sprintf("%s:%d", host, port)
+	fmt.Printf("Web UI listening on http://%s\n", addr)
+	return newHTTPServer(addr, newHTTPHandler(app)).ListenAndServe()
+}
+
+const (
+	subscriptionRefreshTimeout           = 90 * time.Second
+	autoUpdateFailureRetryDelay          = 5 * time.Minute
+	maxAPIRequestBodyBytes               = 2 << 20
+	maxKernelArchiveBytes                = 512 << 20
+	kernelDownloadTimeout                = 30 * time.Minute
+	kernelDownloadIdleTimeout            = 2 * time.Minute
+	kernelDownloadProgressInterval       = 250 * time.Millisecond
+	kernelDownloadProgressBytes    int64 = 1 << 20
+	maxRuntimeLogLineBytes               = 16 << 10
+	runtimeLogTruncatedSuffix            = " [truncated]"
+	autoRestartStablePeriod              = 5 * time.Minute
+	maxAutoRestartDelay                  = 30 * time.Second
+)
+
+func newHTTPHandler(app *App) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/config", app.handleConfig)
 	mux.HandleFunc("/api/subscription/refresh", app.handleSubscriptionRefresh)
@@ -106,26 +134,50 @@ func RunWithStaticFS(staticFS fs.FS) error {
 	mux.HandleFunc("/api/kernel/plan", app.handleKernelPlan)
 	mux.HandleFunc("/api/kernel/download", app.handleKernelDownload)
 	mux.HandleFunc("/", app.handleStatic)
+	return withCORS(withRequestBodyLimit(mux, maxAPIRequestBodyBytes))
+}
 
-	host := getString(getMap(app.cfg, "app"), "host", "0.0.0.0")
-	port := getInt(getMap(app.cfg, "app"), "port", 18080)
-	addr := fmt.Sprintf("%s:%d", host, port)
-	fmt.Printf("Web UI listening on http://%s\n", addr)
-	return http.ListenAndServe(addr, withCORS(mux))
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      35 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+	}
+}
+
+func withRequestBodyLimit(next http.Handler, maxBytes int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") && r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (a *App) runSubscriptionAutoUpdateScheduler() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		a.mu.Lock()
-		a.runSubscriptionAutoUpdateLocked(time.Now())
-		a.mu.Unlock()
+	for now := range ticker.C {
+		a.runSubscriptionAutoUpdate(now)
 	}
 }
 
-func (a *App) runSubscriptionAutoUpdateLocked(now time.Time) {
-	subCfg := getMap(a.cfg, "subscription")
+func (a *App) runSubscriptionAutoUpdate(now time.Time) {
+	if !a.subscriptionRefreshMu.TryLock() {
+		return
+	}
+	defer a.subscriptionRefreshMu.Unlock()
+
+	a.mu.RLock()
+	subCfg := cloneMap(getMap(a.cfg, "subscription"))
+	lastRun := cloneTimeMap(a.autoUpdateLastRun)
+	lastAttempt := cloneTimeMap(a.autoUpdateLastAttempt)
+	a.mu.RUnlock()
+
 	auto := getMap(subCfg, "autoUpdate")
 	scope := strings.TrimSpace(mustStr(auto["scope"]))
 	if scope == "" || scope == "off" {
@@ -133,49 +185,111 @@ func (a *App) runSubscriptionAutoUpdateLocked(now time.Time) {
 	}
 
 	if scope == "simultaneous" {
-		if !shouldRunAutoUpdate(now, a.autoUpdateLastRun["simultaneous"], auto) {
+		key := "simultaneous"
+		if !shouldAttemptAutoUpdate(now, lastRun[key], lastAttempt[key], auto) {
 			return
 		}
-		if err := a.refreshSubscriptionLocked("auto-update(simultaneous)"); err != nil {
+		a.recordAutoUpdateAttempt(key, now)
+		ctx, cancel := context.WithTimeout(context.Background(), subscriptionRefreshTimeout)
+		result := fetchSubscriptionWithContext(ctx, subCfg)
+		cancel()
+		if result.succeeded == 0 {
+			a.mu.Lock()
+			a.appendRuntimeLog("auto update failed: " + subscriptionFetchFailure(result).Error())
+			a.mu.Unlock()
+			return
+		}
+		state := result.state
+		state["updatedAt"] = now.Format(time.RFC3339)
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if !reflect.DeepEqual(getMap(a.cfg, "subscription"), subCfg) {
+			a.appendRuntimeLog("auto update skipped because subscription settings changed during refresh")
+			return
+		}
+		if err := writeJSON(filepath.Join(a.dataDir, "subscription-state.json"), state); err != nil {
 			a.appendRuntimeLog("auto update failed: " + err.Error())
 			return
 		}
-		a.autoUpdateLastRun["simultaneous"] = now
+		a.subState = state
+		a.autoUpdateLastRun[key] = now
 		a.appendRuntimeLog("auto update completed (simultaneous)")
 		return
 	}
 
-	if scope == "independent" {
-		urls := normalizeSubscriptionURLs(subCfg)
-		items := getSlice(auto, "items")
-		if len(urls) == 0 || len(items) == 0 {
+	if scope != "independent" {
+		return
+	}
+	urls := normalizeSubscriptionURLs(subCfg)
+	items := getSlice(auto, "items")
+	if len(urls) == 0 || len(items) == 0 {
+		return
+	}
+	for idx := 0; idx < len(urls) && idx < len(items); idx++ {
+		item, ok := items[idx].(map[string]any)
+		if !ok {
+			continue
+		}
+		key := fmt.Sprintf("independent:%d", idx)
+		if !shouldAttemptAutoUpdate(now, lastRun[key], lastAttempt[key], item) {
+			continue
+		}
+		a.recordAutoUpdateAttempt(key, now)
+		localSub := cloneMap(subCfg)
+		localSub["url"] = urls[idx]
+		localSub["urls"] = []any{urls[idx]}
+		ctx, cancel := context.WithTimeout(context.Background(), subscriptionRefreshTimeout)
+		result := fetchSubscriptionWithContext(ctx, localSub)
+		cancel()
+		if result.succeeded == 0 {
+			a.mu.Lock()
+			a.appendRuntimeLog(fmt.Sprintf("auto update failed (independent #%d): %v", idx+1, subscriptionFetchFailure(result)))
+			a.mu.Unlock()
+			continue
+		}
+		state := result.state
+		state["updatedAt"] = now.Format(time.RFC3339)
+		a.mu.Lock()
+		if !reflect.DeepEqual(getMap(a.cfg, "subscription"), subCfg) {
+			a.appendRuntimeLog("auto update skipped because subscription settings changed during refresh")
+			a.mu.Unlock()
 			return
 		}
-		updated := false
-		for idx := 0; idx < len(urls) && idx < len(items); idx += 1 {
-			item, ok := items[idx].(map[string]any)
-			if !ok {
-				continue
-			}
-			key := fmt.Sprintf("independent:%d", idx)
-			if !shouldRunAutoUpdate(now, a.autoUpdateLastRun[key], item) {
-				continue
-			}
-
-			localSub := cloneMap(subCfg)
-			localSub["url"] = urls[idx]
-			localSub["urls"] = []any{urls[idx]}
-			st := fetchSubscription(localSub)
-			st["updatedAt"] = now.Format(time.RFC3339)
-			a.subState = mergeSubscriptionState(a.subState, st)
-			a.autoUpdateLastRun[key] = now
-			updated = true
-			a.appendRuntimeLog(fmt.Sprintf("auto update completed (independent #%d)", idx+1))
+		merged := mergeSubscriptionState(a.subState, state)
+		if err := writeJSON(filepath.Join(a.dataDir, "subscription-state.json"), merged); err != nil {
+			a.appendRuntimeLog(fmt.Sprintf("auto update failed (independent #%d): %v", idx+1, err))
+			a.mu.Unlock()
+			continue
 		}
-		if updated {
-			_ = writeJSON(filepath.Join(a.dataDir, "subscription-state.json"), a.subState)
-		}
+		a.subState = merged
+		a.autoUpdateLastRun[key] = now
+		a.appendRuntimeLog(fmt.Sprintf("auto update completed (independent #%d)", idx+1))
+		a.mu.Unlock()
 	}
+}
+
+func shouldAttemptAutoUpdate(now, lastRun, lastAttempt time.Time, cfg map[string]any) bool {
+	if !shouldRunAutoUpdate(now, lastRun, cfg) {
+		return false
+	}
+	return lastAttempt.IsZero() || now.Sub(lastAttempt) >= autoUpdateFailureRetryDelay
+}
+
+func cloneTimeMap(in map[string]time.Time) map[string]time.Time {
+	out := make(map[string]time.Time, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func (a *App) recordAutoUpdateAttempt(key string, now time.Time) {
+	a.mu.Lock()
+	if a.autoUpdateLastAttempt == nil {
+		a.autoUpdateLastAttempt = map[string]time.Time{}
+	}
+	a.autoUpdateLastAttempt[key] = now
+	a.mu.Unlock()
 }
 
 func shouldRunAutoUpdate(now, last time.Time, cfg map[string]any) bool {
@@ -295,16 +409,50 @@ func mergeSubscriptionState(base, incoming map[string]any) map[string]any {
 	return out
 }
 
-func (a *App) refreshSubscriptionLocked(reason string) error {
-	subCfg := getMap(a.cfg, "subscription")
-	st := fetchSubscription(subCfg)
-	st["updatedAt"] = time.Now().Format(time.RFC3339)
-	a.subState = st
-	if err := writeJSON(filepath.Join(a.dataDir, "subscription-state.json"), st); err != nil {
-		return err
+func (a *App) refreshSubscription(ctx context.Context, reason string) (map[string]any, error) {
+	a.subscriptionRefreshMu.Lock()
+	defer a.subscriptionRefreshMu.Unlock()
+
+	a.mu.RLock()
+	subCfg := cloneMap(getMap(a.cfg, "subscription"))
+	a.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(ctx, subscriptionRefreshTimeout)
+	defer cancel()
+	result := fetchSubscriptionWithContext(ctx, subCfg)
+	if result.succeeded == 0 {
+		err := subscriptionFetchFailure(result)
+		a.mu.Lock()
+		a.appendRuntimeLog("subscription refresh failed (" + reason + "): " + err.Error())
+		a.mu.Unlock()
+		return nil, err
 	}
+
+	state := result.state
+	state["updatedAt"] = time.Now().Format(time.RFC3339)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !reflect.DeepEqual(getMap(a.cfg, "subscription"), subCfg) {
+		return nil, fmt.Errorf("subscription settings changed during refresh; please retry")
+	}
+	if err := writeJSON(filepath.Join(a.dataDir, "subscription-state.json"), state); err != nil {
+		return nil, err
+	}
+	a.subState = state
 	a.appendRuntimeLog("subscription refreshed: " + reason)
-	return nil
+	return cloneMap(state), nil
+}
+
+func subscriptionFetchFailure(result subscriptionFetchResult) error {
+	detail := "no subscription source succeeded"
+	warnings := getSlice(result.state, "warnings")
+	if len(warnings) > 0 {
+		detail = mustStr(warnings[0])
+	}
+	if result.attempted == 0 {
+		return fmt.Errorf("no subscription URL configured: %s", detail)
+	}
+	return fmt.Errorf("all %d subscription source(s) failed: %s", result.attempted, detail)
 }
 
 func (a *App) loadOrInit() error {
@@ -390,8 +538,7 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		a.mu.RLock()
-		defer a.mu.RUnlock()
-		ok(w, map[string]any{
+		payload, err := json.Marshal(map[string]any{
 			"config":             a.cfg,
 			"subscription":       a.subState,
 			"availableOutbounds": collectOutbounds(a.cfg, a.subState),
@@ -402,10 +549,16 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 			"releaseList":        a.releaseList,
 			"download":           a.downloadState,
 		})
+		a.mu.RUnlock()
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		okBytes(w, payload)
 	case http.MethodPost:
 		var body map[string]any
 		if err := decodeJSON(r.Body, &body); err != nil {
-			fail(w, 400, err.Error())
+			failDecodeJSON(w, err)
 			return
 		}
 		skipRuntimeRestart := strings.TrimSpace(r.Header.Get("x-skip-runtime-restart")) == "1"
@@ -419,14 +572,18 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 			if err := a.startRuntimeLocked(); err != nil {
 				a.appendRuntimeLog("apply config failed: " + err.Error())
 				a.mu.Unlock()
-				fail(w, 500, err.Error())
+				fail(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			a.appendRuntimeLog("config applied and runtime restarted")
 		}
-		runtimeState := a.runtimeInfo
+		payload, err := json.Marshal(map[string]any{"ok": true, "generated": generated, "runtime": a.runtimeInfo})
 		a.mu.Unlock()
-		ok(w, map[string]any{"ok": true, "generated": generated, "runtime": runtimeState})
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		okBytes(w, payload)
 	default:
 		methodNotAllowed(w, "GET, POST")
 	}
@@ -437,31 +594,29 @@ func (a *App) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Request) 
 		methodNotAllowed(w, "POST")
 		return
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.refreshSubscriptionLocked("manual"); err != nil {
-		fail(w, 500, err.Error())
+	state, err := a.refreshSubscription(r.Context(), "manual")
+	if err != nil {
+		fail(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	ok(w, a.subState)
+	ok(w, state)
 }
 
 func (a *App) handleNodes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		a.mu.RLock()
-		defer a.mu.RUnlock()
 		nr := getMap(a.cfg, "nodeRegistry")
 		disabled := toStringSet(getSlice(nr, "disabledSubscriptionTags"))
 		nodes := []any{}
 		for _, n := range getSlice(a.subState, "nodes") {
-			m, okk := n.(map[string]any)
-			if !okk || disabled[mustStr(m["tag"])] {
+			m, ok := n.(map[string]any)
+			if !ok || disabled[mustStr(m["tag"])] {
 				continue
 			}
 			nodes = append(nodes, m)
 		}
-		ok(w, map[string]any{
+		payload, err := json.Marshal(map[string]any{
 			"subscriptionNodes":        nodes,
 			"disabledSubscriptionTags": getSlice(nr, "disabledSubscriptionTags"),
 			"manualNodes":              getSlice(nr, "manualNodes"),
@@ -470,10 +625,16 @@ func (a *App) handleNodes(w http.ResponseWriter, r *http.Request) {
 			"availableOutbounds":       collectOutbounds(a.cfg, a.subState),
 			"fallbackStates":           map[string]any{},
 		})
+		a.mu.RUnlock()
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		okBytes(w, payload)
 	case http.MethodPost:
 		var body map[string]any
 		if err := decodeJSON(r.Body, &body); err != nil {
-			fail(w, 400, err.Error())
+			failDecodeJSON(w, err)
 			return
 		}
 		a.mu.Lock()
@@ -489,14 +650,24 @@ func (a *App) handleNodes(w http.ResponseWriter, r *http.Request) {
 			if err := a.startRuntimeLocked(); err != nil {
 				a.appendRuntimeLog("apply node config failed: " + err.Error())
 				a.mu.Unlock()
-				fail(w, 500, err.Error())
+				fail(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			a.appendRuntimeLog("node config applied and runtime restarted")
 		}
-		outbounds := collectOutbounds(a.cfg, a.subState)
+		payload, err := json.Marshal(map[string]any{
+			"ok":                 true,
+			"manualNodes":        nr["manualNodes"],
+			"groups":             nr["groups"],
+			"chains":             nr["chains"],
+			"availableOutbounds": collectOutbounds(a.cfg, a.subState),
+		})
 		a.mu.Unlock()
-		ok(w, map[string]any{"ok": true, "manualNodes": nr["manualNodes"], "groups": nr["groups"], "chains": nr["chains"], "availableOutbounds": outbounds})
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		okBytes(w, payload)
 	default:
 		methodNotAllowed(w, "GET, POST")
 	}
@@ -509,7 +680,7 @@ func (a *App) handleNodeImport(w http.ResponseWriter, r *http.Request) {
 	}
 	var body map[string]any
 	if err := decodeJSON(r.Body, &body); err != nil {
-		fail(w, 400, err.Error())
+		failDecodeJSON(w, err)
 		return
 	}
 	res := parseManualNodeInput(mustStr(body["raw"]))
@@ -523,7 +694,7 @@ func (a *App) handleNodesCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	var body map[string]any
 	if err := decodeJSON(r.Body, &body); err != nil {
-		fail(w, 400, err.Error())
+		failDecodeJSON(w, err)
 		return
 	}
 	tags := []string{}
@@ -564,7 +735,7 @@ func (a *App) handleNextPort(w http.ResponseWriter, r *http.Request) {
 	}
 	var body map[string]any
 	if err := decodeJSON(r.Body, &body); err != nil {
-		fail(w, 400, err.Error())
+		failDecodeJSON(w, err)
 		return
 	}
 	host := mustStr(body["host"])
@@ -598,16 +769,25 @@ func (a *App) handleRuntimeStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if err := a.startRuntimeLocked(); err != nil {
-		fail(w, 400, err.Error())
+		a.mu.Unlock()
+		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rt := a.runtimeInfo
-	ok(w, rt)
+	payload, err := json.Marshal(a.runtimeInfo)
+	a.mu.Unlock()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	okBytes(w, payload)
 }
 
 func (a *App) startRuntimeLocked() error {
+	return a.startRuntimeLockedWithRestartReset(true)
+}
+
+func (a *App) startRuntimeLockedWithRestartReset(resetRestartAttempts bool) error {
 	if err := ensureNodesLoaded(a.cfg, a.subState); err != nil {
 		return err
 	}
@@ -623,13 +803,19 @@ func (a *App) startRuntimeLocked() error {
 		return err
 	}
 	cmd := exec.Command(bin, "run", "-c", cfgPath)
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("create sing-box stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("create sing-box stderr pipe: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	a.manualStopRequested = false
-	a.autoRestartAttempts = 0
+	a.recordRuntimeStartedLocked(time.Now(), resetRestartAttempts)
 	a.proc = cmd
 	a.runtimeInfo["state"] = "running"
 	a.runtimeInfo["running"] = true
@@ -649,12 +835,9 @@ func (a *App) startRuntimeLocked() error {
 				a.appendRuntimeLog("sing-box exited")
 			}
 			if !a.manualStopRequested {
-				a.autoRestartAttempts += 1
-				attempt := a.autoRestartAttempts
-				delay := time.Duration(attempt*2) * time.Second
-				if delay > 30*time.Second {
-					delay = 30 * time.Second
-				}
+				runDuration := time.Since(a.runtimeStartedAt)
+				attempt, delay := nextAutoRestart(a.autoRestartAttempts, runDuration)
+				a.autoRestartAttempts = attempt
 				a.appendRuntimeLog(fmt.Sprintf("runtime stopped unexpectedly, auto-restart in %ds (attempt %d)", int(delay/time.Second), attempt))
 				go a.autoRestartAfter(delay)
 			}
@@ -671,9 +854,34 @@ func (a *App) autoRestartAfter(delay time.Duration) {
 	if a.proc != nil || a.manualStopRequested {
 		return
 	}
-	if err := a.startRuntimeLocked(); err != nil {
-		a.appendRuntimeLog("auto restart failed: " + err.Error())
+	if err := a.startRuntimeLockedWithRestartReset(false); err != nil {
+		attempt, nextDelay := nextAutoRestart(a.autoRestartAttempts, 0)
+		a.autoRestartAttempts = attempt
+		a.appendRuntimeLog(fmt.Sprintf("auto restart failed: %v; retry in %ds (attempt %d)", err, int(nextDelay/time.Second), attempt))
+		go a.autoRestartAfter(nextDelay)
 	}
+}
+
+func (a *App) recordRuntimeStartedLocked(now time.Time, resetRestartAttempts bool) {
+	if resetRestartAttempts {
+		a.autoRestartAttempts = 0
+	}
+	a.runtimeStartedAt = now
+}
+
+func nextAutoRestart(previousAttempts int, runDuration time.Duration) (int, time.Duration) {
+	if previousAttempts < 0 || runDuration >= autoRestartStablePeriod {
+		previousAttempts = 0
+	}
+	attempt := previousAttempts + 1
+	delay := 2 * time.Second
+	for i := 1; i < attempt && delay < maxAutoRestartDelay; i++ {
+		delay *= 2
+		if delay > maxAutoRestartDelay {
+			delay = maxAutoRestartDelay
+		}
+	}
+	return attempt, delay
 }
 
 func (a *App) handleRuntimeStop(w http.ResponseWriter, r *http.Request) {
@@ -691,9 +899,13 @@ func (a *App) handleRuntimeStop(w http.ResponseWriter, r *http.Request) {
 	a.runtimeInfo["state"] = "stopped"
 	a.runtimeInfo["running"] = false
 	a.appendRuntimeLog("runtime stop requested")
-	rt := a.runtimeInfo
+	payload, err := json.Marshal(a.runtimeInfo)
 	a.mu.Unlock()
-	ok(w, rt)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	okBytes(w, payload)
 }
 
 func (a *App) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
@@ -702,8 +914,13 @@ func (a *App) handleRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	ok(w, a.runtimeInfo)
+	payload, err := json.Marshal(a.runtimeInfo)
+	a.mu.RUnlock()
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	okBytes(w, payload)
 }
 
 func (a *App) handleRuntimeGenerated(w http.ResponseWriter, r *http.Request) {
@@ -739,9 +956,13 @@ func (a *App) handleKernelArch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		a.mu.RLock()
-		planned := a.plannedKernel
+		payload, err := json.Marshal(map[string]any{"architecture": arch, "stored": true, "plannedKernel": a.plannedKernel, "kernel": a.kernelStatus()})
 		a.mu.RUnlock()
-		ok(w, map[string]any{"architecture": arch, "stored": true, "plannedKernel": planned, "kernel": a.kernelStatus()})
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		okBytes(w, payload)
 	default:
 		methodNotAllowed(w, "GET, POST")
 	}
@@ -762,18 +983,26 @@ func (a *App) handleKernelReleases(w http.ResponseWriter, r *http.Request) {
 	}
 	a.mu.RLock()
 	if len(a.releaseList) > 0 {
-		cached := a.releaseList
+		payload, err := json.Marshal(a.releaseList)
 		a.mu.RUnlock()
-		ok(w, cached)
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		okBytes(w, payload)
 		return
 	}
 	a.mu.RUnlock()
 	releases, err := listReleases(detectPlatform())
 	if err != nil {
 		a.mu.RLock()
-		cached := a.releaseList
+		payload, marshalErr := json.Marshal(a.releaseList)
 		a.mu.RUnlock()
-		ok(w, cached)
+		if marshalErr != nil {
+			fail(w, http.StatusInternalServerError, marshalErr.Error())
+			return
+		}
+		okBytes(w, payload)
 		return
 	}
 	a.mu.Lock()
@@ -790,21 +1019,25 @@ func (a *App) handleKernelReleasesUpdate(w http.ResponseWriter, r *http.Request)
 	}
 	releases, err := listReleases(detectPlatform())
 	if err != nil {
-		fail(w, 500, err.Error())
+		fail(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	a.mu.Lock()
 	a.releaseList = releases
 	_ = writeJSON(filepath.Join(a.dataDir, "release-list.json"), releases)
 	if len(releases) > 0 {
-		if p, okk := releases[0].(map[string]any); okk {
-			a.plannedKernel = p
-			_ = writeJSON(filepath.Join(a.dataDir, "planned-kernel-info.json"), p)
+		if planned, ok := releases[0].(map[string]any); ok {
+			a.plannedKernel = planned
+			_ = writeJSON(filepath.Join(a.dataDir, "planned-kernel-info.json"), planned)
 		}
 	}
-	planned := a.plannedKernel
+	payload, marshalErr := json.Marshal(map[string]any{"releaseList": releases, "plannedKernel": a.plannedKernel})
 	a.mu.Unlock()
-	ok(w, map[string]any{"releaseList": releases, "plannedKernel": planned})
+	if marshalErr != nil {
+		fail(w, http.StatusInternalServerError, marshalErr.Error())
+		return
+	}
+	okBytes(w, payload)
 }
 
 func (a *App) handleKernelPlan(w http.ResponseWriter, r *http.Request) {
@@ -813,54 +1046,75 @@ func (a *App) handleKernelPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]any
-	_ = decodeJSON(r.Body, &body)
+	if err := decodeJSON(r.Body, &body); err != nil {
+		failDecodeJSON(w, err)
+		return
+	}
 	version := mustStr(body["version"])
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	for _, item := range a.releaseList {
-		m, okk := item.(map[string]any)
-		if okk && mustStr(m["version"]) == version {
-			a.plannedKernel = m
-			_ = writeJSON(filepath.Join(a.dataDir, "planned-kernel-info.json"), m)
-			ok(w, m)
+		planned, ok := item.(map[string]any)
+		if ok && mustStr(planned["version"]) == version {
+			a.plannedKernel = planned
+			_ = writeJSON(filepath.Join(a.dataDir, "planned-kernel-info.json"), planned)
+			payload, err := json.Marshal(planned)
+			a.mu.Unlock()
+			if err != nil {
+				fail(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			okBytes(w, payload)
 			return
 		}
 	}
-	fail(w, 404, "Requested kernel version not found")
+	a.mu.Unlock()
+	fail(w, http.StatusNotFound, "Requested kernel version not found")
 }
 
 func (a *App) handleKernelDownload(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		a.mu.RLock()
-		st := a.downloadState
+		payload, err := json.Marshal(a.downloadState)
 		a.mu.RUnlock()
-		ok(w, st)
+		if err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		okBytes(w, payload)
 	case http.MethodPost:
 		a.mu.Lock()
-		planned := a.plannedKernel
+		if getBool(a.downloadState, "active", false) {
+			a.mu.Unlock()
+			fail(w, http.StatusConflict, "A kernel download is already active")
+			return
+		}
+		planned := cloneMap(a.plannedKernel)
+		if len(planned) == 0 {
+			a.mu.Unlock()
+			fail(w, http.StatusBadRequest, "No planned kernel selected")
+			return
+		}
 		a.downloadState = map[string]any{"active": true, "steps": []any{}, "progress": map[string]any{"percent": 0, "stage": "prepare", "message": "preparing"}, "updatedAt": time.Now().Format(time.RFC3339)}
 		a.pushDownloadStepLocked("prepare", "Prepared download workspace", map[string]any{})
 		a.mu.Unlock()
-		if planned == nil {
-			fail(w, 400, "No planned kernel selected")
-			return
-		}
-		result, err := a.downloadKernel(planned)
+		result, err := a.downloadKernel(r.Context(), planned)
 		if err != nil {
 			a.mu.Lock()
 			a.downloadState = map[string]any{"active": false, "steps": []any{map[string]any{"stage": "error", "message": err.Error()}}, "progress": map[string]any{"percent": nil, "stage": "error", "message": err.Error()}, "updatedAt": time.Now().Format(time.RFC3339)}
-			ds := a.downloadState
 			a.mu.Unlock()
-			fail(w, 500, err.Error())
-			_ = ds
+			fail(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		a.mu.Lock()
 		a.downloadState = map[string]any{"active": false, "steps": []any{map[string]any{"stage": "done", "message": "Kernel installation completed"}}, "progress": map[string]any{"percent": 100, "stage": "done", "message": "Kernel installation completed"}, "updatedAt": time.Now().Format(time.RFC3339)}
-		ds := a.downloadState
+		payload, marshalErr := json.Marshal(map[string]any{"result": result, "kernel": a.kernelStatus(), "download": a.downloadState})
 		a.mu.Unlock()
-		ok(w, map[string]any{"result": result, "kernel": a.kernelStatus(), "download": ds})
+		if marshalErr != nil {
+			fail(w, http.StatusInternalServerError, marshalErr.Error())
+			return
+		}
+		okBytes(w, payload)
 	default:
 		methodNotAllowed(w, "GET, POST")
 	}
@@ -942,27 +1196,60 @@ func (a *App) appendRuntimeLog(msg string) {
 func (a *App) captureLogs(r io.ReadCloser) {
 	defer r.Close()
 	buf := make([]byte, 4096)
-	acc := ""
+	acc := make([]byte, 0, maxRuntimeLogLineBytes)
+	truncated := false
+
+	flush := func() {
+		lineBytes := bytes.TrimSpace(acc)
+		if truncated {
+			contentLimit := maxRuntimeLogLineBytes - len(runtimeLogTruncatedSuffix)
+			if len(lineBytes) > contentLimit {
+				lineBytes = lineBytes[:contentLimit]
+			}
+			lineBytes = append(append([]byte(nil), lineBytes...), runtimeLogTruncatedSuffix...)
+		}
+		line := strings.TrimSpace(strings.ToValidUTF8(string(lineBytes), "?"))
+		if line != "" {
+			a.mu.Lock()
+			a.appendRuntimeLog(line)
+			a.mu.Unlock()
+		}
+		acc = acc[:0]
+		truncated = false
+	}
+
+	appendSegment := func(segment []byte) {
+		remaining := maxRuntimeLogLineBytes - len(acc)
+		if remaining > 0 {
+			if len(segment) <= remaining {
+				acc = append(acc, segment...)
+				return
+			}
+			acc = append(acc, segment[:remaining]...)
+		}
+		if len(segment) > remaining {
+			truncated = true
+		}
+	}
+
 	for {
-		n, err := r.Read(buf)
+		n, readErr := r.Read(buf)
 		if n > 0 {
-			acc += string(buf[:n])
-			for {
-				i := strings.IndexAny(acc, "\r\n")
-				if i < 0 {
+			chunk := buf[:n]
+			for len(chunk) > 0 {
+				separator := bytes.IndexAny(chunk, "\r\n")
+				if separator < 0 {
+					appendSegment(chunk)
 					break
 				}
-				line := strings.TrimSpace(acc[:i])
-				acc = strings.TrimLeft(acc[i+1:], "\r\n")
-				if line != "" {
-					a.mu.Lock()
-					a.appendRuntimeLog(line)
-					a.mu.Unlock()
-				}
+				appendSegment(chunk[:separator])
+				flush()
+				chunk = bytes.TrimLeft(chunk[separator+1:], "\r\n")
 			}
 		}
-		if err != nil {
-			break
+		if readErr != nil {
+			flush()
+			return
 		}
 	}
 }
@@ -1020,7 +1307,7 @@ func (a *App) handleNodesEgress(w http.ResponseWriter, r *http.Request) {
 	}
 	var body map[string]any
 	if err := decodeJSON(r.Body, &body); err != nil {
-		fail(w, 400, err.Error())
+		failDecodeJSON(w, err)
 		return
 	}
 	tags := []string{}
@@ -1317,7 +1604,172 @@ func pickAsset(assets []any, suffix string) map[string]any {
 	return nil
 }
 
-func (a *App) downloadKernel(release map[string]any) (map[string]any, error) {
+func newKernelDownloadClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   15 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	transport.TLSHandshakeTimeout = 15 * time.Second
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport.ExpectContinueTimeout = time.Second
+	transport.IdleConnTimeout = 90 * time.Second
+	return &http.Client{
+		Transport: transport,
+		Timeout:   kernelDownloadTimeout,
+	}
+}
+
+type downloadProgressLimiter struct {
+	lastAt    time.Time
+	lastBytes int64
+}
+
+func (l *downloadProgressLimiter) shouldReport(now time.Time, downloaded int64, force bool) bool {
+	if downloaded <= l.lastBytes {
+		return false
+	}
+	if !force && downloaded-l.lastBytes < kernelDownloadProgressBytes && now.Sub(l.lastAt) < kernelDownloadProgressInterval {
+		return false
+	}
+	l.lastAt = now
+	l.lastBytes = downloaded
+	return true
+}
+
+func downloadKernelArchive(
+	ctx context.Context,
+	client *http.Client,
+	urlStr string,
+	archivePath string,
+	expectedSize int64,
+	maxBytes int64,
+	idleTimeout time.Duration,
+	onProgress func(downloaded, total int64),
+) (int64, error) {
+	if maxBytes <= 0 {
+		return 0, fmt.Errorf("kernel archive maximum size must be positive")
+	}
+	if idleTimeout <= 0 {
+		return 0, fmt.Errorf("kernel download idle timeout must be positive")
+	}
+
+	requestCtx, cancel := context.WithCancel(ctx)
+	activity := make(chan struct{}, 1)
+	idleTimedOut := make(chan struct{})
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		timer := time.NewTimer(idleTimeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-activity:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(idleTimeout)
+			case <-timer.C:
+				close(idleTimedOut)
+				cancel()
+				return
+			case <-requestCtx.Done():
+				return
+			}
+		}
+	}()
+	defer func() {
+		cancel()
+		<-watchdogDone
+	}()
+	signalActivity := func() {
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
+	}
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("user-agent", "sub2socks5-go/0.1.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		select {
+		case <-idleTimedOut:
+			return 0, fmt.Errorf("kernel download stalled for %s", idleTimeout)
+		default:
+			return 0, err
+		}
+	}
+	defer resp.Body.Close()
+	signalActivity()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return 0, fmt.Errorf("failed to download sing-box: HTTP %d", resp.StatusCode)
+	}
+
+	total := resp.ContentLength
+	if total <= 0 {
+		total = expectedSize
+	}
+	if total > maxBytes {
+		return 0, fmt.Errorf("kernel archive size %d exceeds maximum %d bytes", total, maxBytes)
+	}
+
+	f, err := os.Create(archivePath)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+
+	buf := make([]byte, 64*1024)
+	var downloaded int64
+	limiter := downloadProgressLimiter{lastAt: time.Now()}
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			signalActivity()
+			if downloaded+int64(n) > maxBytes {
+				return downloaded, fmt.Errorf("kernel archive exceeds maximum %d bytes", maxBytes)
+			}
+			written, writeErr := f.Write(buf[:n])
+			if writeErr != nil {
+				return downloaded, writeErr
+			}
+			if written != n {
+				return downloaded, io.ErrShortWrite
+			}
+			downloaded += int64(n)
+			if onProgress != nil && limiter.shouldReport(time.Now(), downloaded, false) {
+				onProgress(downloaded, total)
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			select {
+			case <-idleTimedOut:
+				return downloaded, fmt.Errorf("kernel download stalled for %s", idleTimeout)
+			default:
+				return downloaded, readErr
+			}
+		}
+	}
+	if onProgress != nil && limiter.shouldReport(time.Now(), downloaded, true) {
+		onProgress(downloaded, total)
+	}
+	if err := f.Close(); err != nil {
+		return downloaded, err
+	}
+	return downloaded, nil
+}
+
+func (a *App) downloadKernel(ctx context.Context, release map[string]any) (map[string]any, error) {
 	urlStr := mustStr(release["downloadUrl"])
 	assetName := mustStr(release["assetName"])
 	if urlStr == "" || assetName == "" {
@@ -1332,56 +1784,38 @@ func (a *App) downloadKernel(release map[string]any) (map[string]any, error) {
 	a.mu.Lock()
 	a.pushDownloadStepLocked("prepare", "Download workspace ready", map[string]any{"assetName": assetName})
 	a.mu.Unlock()
-	req, _ := http.NewRequest(http.MethodGet, urlStr, nil)
-	req.Header.Set("user-agent", "sub2socks5-go/0.1.0")
-	resp, err := (&http.Client{Timeout: 0}).Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("Failed to download sing-box: HTTP %d", resp.StatusCode)
-	}
-	f, err := os.Create(archivePath)
-	if err != nil {
-		return nil, err
-	}
-	total := toFloat(resp.ContentLength)
-	if total <= 0 {
-		total = toFloat(release["size"])
-	}
-	buf := make([]byte, 64*1024)
-	var downloaded float64
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, wErr := f.Write(buf[:n]); wErr != nil {
-				f.Close()
-				return nil, wErr
-			}
-			downloaded += float64(n)
+	expectedSize := int64(toFloat(release["size"]))
+	downloadCtx, cancel := context.WithTimeout(ctx, kernelDownloadTimeout)
+	defer cancel()
+	_, err = downloadKernelArchive(
+		downloadCtx,
+		newKernelDownloadClient(),
+		urlStr,
+		archivePath,
+		expectedSize,
+		maxKernelArchiveBytes,
+		kernelDownloadIdleTimeout,
+		func(downloaded, total int64) {
 			percent := any(nil)
 			if total > 0 {
-				percent = float64(int((downloaded/total)*10000)) / 100
+				percent = float64(downloaded) / float64(total) * 100
+				if percent.(float64) > 100 {
+					percent = float64(100)
+				}
 			}
 			a.mu.Lock()
 			a.pushDownloadStepLocked("download", "Downloading kernel archive", map[string]any{
-				"downloadedBytes": int(downloaded),
-				"totalBytes":      int(total),
+				"downloadedBytes": downloaded,
+				"totalBytes":      total,
 				"percent":         percent,
 				"threads":         1,
 			})
 			a.mu.Unlock()
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			f.Close()
-			return nil, readErr
-		}
+		},
+	)
+	if err != nil {
+		return nil, err
 	}
-	_ = f.Close()
 	extractDir := filepath.Join(tmpDir, "extract")
 	_ = os.MkdirAll(extractDir, 0o755)
 	a.mu.Lock()
@@ -1689,10 +2123,25 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
+func okBytes(w http.ResponseWriter, payload []byte) {
+	w.Header().Set("content-type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload)
+}
+
 func ok(w http.ResponseWriter, v any) {
 	w.Header().Set("content-type", "application/json; charset=utf-8")
 	w.WriteHeader(200)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func failDecodeJSON(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		status = http.StatusRequestEntityTooLarge
+	}
+	fail(w, status, err.Error())
 }
 
 func fail(w http.ResponseWriter, status int, msg string) {

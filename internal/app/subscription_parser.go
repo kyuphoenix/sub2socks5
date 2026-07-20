@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -14,7 +15,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const maxSubscriptionBodyBytes int64 = 16 << 20
+
+type subscriptionFetchResult struct {
+	state     map[string]any
+	attempted int
+	succeeded int
+}
+
 func fetchSubscription(sub map[string]any) map[string]any {
+	return fetchSubscriptionWithContext(context.Background(), sub).state
+}
+
+func fetchSubscriptionWithContext(ctx context.Context, sub map[string]any) subscriptionFetchResult {
 	urls := []string{}
 	for _, v := range getSlice(sub, "urls") {
 		s := strings.TrimSpace(mustStr(v))
@@ -28,7 +41,9 @@ func fetchSubscription(sub map[string]any) map[string]any {
 		}
 	}
 	if len(urls) == 0 {
-		return map[string]any{"nodes": []any{}, "raw": "", "warnings": []any{"订阅地址为空"}}
+		return subscriptionFetchResult{
+			state: map[string]any{"nodes": []any{}, "raw": "", "warnings": []any{"\u8ba2\u9605\u5730\u5740\u4e3a\u7a7a"}},
+		}
 	}
 
 	warnings := []any{}
@@ -36,20 +51,40 @@ func fetchSubscription(sub map[string]any) map[string]any {
 	nodes := []map[string]any{}
 	filters := getSlice(sub, "filters")
 	client := &http.Client{Timeout: 20 * time.Second}
+	result := subscriptionFetchResult{attempted: len(urls)}
 	for idx, u := range urls {
-		req, _ := http.NewRequest(http.MethodGet, u, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("\u8ba2\u9605\u5730\u5740\u65e0\u6548: %s %v", u, err))
+			continue
+		}
 		req.Header.Set("user-agent", getString(sub, "userAgent", "sub2socks5-go/0.1.0"))
+		for key, value := range getMap(sub, "headers") {
+			name := strings.TrimSpace(key)
+			if name != "" {
+				req.Header.Set(name, mustStr(value))
+			}
+		}
 		resp, err := client.Do(req)
 		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("订阅拉取失败: %s %v", u, err))
+			warnings = append(warnings, fmt.Sprintf("\u8ba2\u9605\u62c9\u53d6\u5931\u8d25: %s %v", u, err))
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBodyBytes+1))
 		_ = resp.Body.Close()
 		if resp.StatusCode >= 400 {
-			warnings = append(warnings, fmt.Sprintf("订阅拉取失败: %s HTTP %d", u, resp.StatusCode))
+			warnings = append(warnings, fmt.Sprintf("\u8ba2\u9605\u62c9\u53d6\u5931\u8d25: %s HTTP %d", u, resp.StatusCode))
 			continue
 		}
+		if readErr != nil {
+			warnings = append(warnings, fmt.Sprintf("\u8ba2\u9605\u8bfb\u53d6\u5931\u8d25: %s %v", u, readErr))
+			continue
+		}
+		if int64(len(body)) > maxSubscriptionBodyBytes {
+			warnings = append(warnings, fmt.Sprintf("\u8ba2\u9605\u5185\u5bb9\u8fc7\u5927: %s \u8d85\u8fc7 %d MiB", u, maxSubscriptionBodyBytes>>20))
+			continue
+		}
+		result.succeeded++
 		txt := string(body)
 		rawParts = append(rawParts, "### "+u+"\n"+txt)
 		parsed := parseSubscription(txt)
@@ -71,11 +106,12 @@ func fetchSubscription(sub map[string]any) map[string]any {
 				nodes = append(nodes, n)
 			}
 		}
-		for _, w := range parsed.warnings {
-			warnings = append(warnings, "["+u+"] "+w)
+		for _, warning := range parsed.warnings {
+			warnings = append(warnings, "["+u+"] "+warning)
 		}
 	}
-	return map[string]any{"nodes": dedupeNodes(nodes), "raw": strings.Join(rawParts, "\n\n"), "warnings": warnings}
+	result.state = map[string]any{"nodes": dedupeNodes(nodes), "raw": strings.Join(rawParts, "\n\n"), "warnings": warnings}
+	return result
 }
 
 func shouldKeepNodeByFilter(node map[string]any, mode string, keywords []string) bool {
