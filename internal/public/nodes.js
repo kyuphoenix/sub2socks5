@@ -72,6 +72,7 @@ function renderAvailableNodes() {
   }
 
   for (const node of visibleNodes) {
+    const nodeName = String(node.tag || '');
     const delayState = nodeDelayState[node.tag];
     const isChecking = checkingNodeTags.has(node.tag) || delayState?.loading;
     const delayText = isChecking ? '测试中...' : delayState?.text || '延迟';
@@ -79,10 +80,10 @@ function renderAvailableNodes() {
       ? `点击重新测试延迟；最近${delayState.source === 'runtime' ? '自动' : '手动'}测试：${delayState.checkedAt}`
       : '点击测试延迟';
     const card = document.createElement('div');
-    card.className = 'node-pill node-pill-checkable';
+    card.className = 'node-pill node-pill-checkable available-node-card';
     card.innerHTML = `
       <div class="node-pill-main">
-        <div class="node-pill-title">${escapeHtml(node.tag || '')}</div>
+        <div class="node-pill-title ${nodeTitleDensityClass(nodeName)}" title="${escapeHtmlAttr(nodeName)}">${escapeHtml(nodeName)}</div>
         <div class="node-pill-tags">
           <span class="node-pill-tag">${escapeHtml(node.type || '')}</span>
           <span class="node-pill-tag is-source">${escapeHtml(sourceLabel(node.source))}</span>
@@ -92,6 +93,17 @@ function renderAvailableNodes() {
     `;
     availableNodeListEl.appendChild(card);
   }
+}
+
+function nodeTitleDensityClass(value) {
+  const visualLength = Array.from(String(value || '')).reduce((length, character) => {
+    const codePoint = character.codePointAt(0) || 0;
+    return length + (codePoint > 0xff ? 1 : 0.55);
+  }, 0);
+
+  if (visualLength > 34) return 'is-extra-long';
+  if (visualLength > 22) return 'is-long';
+  return '';
 }
 
 function renderGroups() {

@@ -616,17 +616,8 @@ func (a *App) handleNodes(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		a.mu.RLock()
 		nr := getMap(a.cfg, "nodeRegistry")
-		disabled := toStringSet(getSlice(nr, "disabledSubscriptionTags"))
-		nodes := []any{}
-		for _, n := range getSlice(a.subState, "nodes") {
-			m, ok := n.(map[string]any)
-			if !ok || disabled[mustStr(m["tag"])] {
-				continue
-			}
-			nodes = append(nodes, m)
-		}
 		payload, err := json.Marshal(map[string]any{
-			"subscriptionNodes":        nodes,
+			"subscriptionNodes":        getSlice(a.subState, "nodes"),
 			"disabledSubscriptionTags": getSlice(nr, "disabledSubscriptionTags"),
 			"manualNodes":              getSlice(nr, "manualNodes"),
 			"groups":                   getSlice(nr, "groups"),
