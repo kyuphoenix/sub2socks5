@@ -181,6 +181,10 @@ function buildGroupPanel(index, group, selectableNodes) {
         <label class="${GROUP_TEST_URL_PRESETS.includes(group.url) ? 'is-hidden' : ''}"><span>自定义测试地址</span><input data-kind="group" data-index="${index}" data-field="url" value="${escapeHtmlAttr(group.url || 'https://www.gstatic.com/generate_204')}" /></label>
       </div>
       ${statusHtml}
+      <div class="member-regex-row">
+        <input type="text" class="member-regex-input" data-group-keywords="${index}" placeholder="输入关键词（用逗号分隔），匹配节点名称后批量添加" value="${escapeHtmlAttr(group.keywords || '')}" />
+        <button type="button" class="member-add" data-add-keyword-members="${index}">按关键词添加</button>
+      </div>
       <div class="member-selector">${renderGroupMembers(index, group, selectableNodes)}</div>
       <div class="section-heading-actions">
         <button type="button" data-remove-group="${index}">删除</button>
@@ -264,6 +268,24 @@ function renderChainMembers(index, chain, selectableNodes) {
   const remaining = selectableNodes.filter((node) => !selected.includes(node.tag));
   rows.push(`<button type="button" class="member-add" data-add-chain-member="${index}" ${remaining.length ? '' : 'disabled'}>+ 添加节点</button>`);
   return rows.join('');
+}
+
+function addMatchingGroupMembers(groupIndex, keywordsText) {
+  const keywords = keywordsText.split(',').map((keyword) => keyword.trim()).filter(Boolean);
+  const baseNodes = [...(state.subscriptionNodes || []), ...(state.manualNodes || [])];
+  state.groups[groupIndex].members = state.groups[groupIndex].members || [];
+  const selected = new Set(state.groups[groupIndex].members);
+  let added = 0;
+  for (const node of baseNodes) {
+    const tag = String(node.tag || '').trim();
+    if (!tag || selected.has(tag)) continue;
+    if (keywords.some((keyword) => tag.includes(keyword))) {
+      state.groups[groupIndex].members.push(tag);
+      selected.add(tag);
+      added += 1;
+    }
+  }
+  return added;
 }
 
 function buildMemberOptions(selectableNodes, selectedTags, currentTag) {
@@ -601,6 +623,11 @@ document.addEventListener('input', (event) => {
     state.groups[index][field] = field === 'timeoutMs' ? Number(target.value || 0) : target.value;
   }
 
+  if ('groupKeywords' in target.dataset) {
+    const index = Number(target.dataset.groupKeywords);
+    state.groups[index].keywords = target.value;
+  }
+
   if (target.dataset.kind === 'group-preset') {
     const index = Number(target.dataset.index);
     if (target.value !== 'custom') {
@@ -667,6 +694,22 @@ document.addEventListener('click', (event) => {
       state.groups[groupIndex].members.push(nextNode.tag);
       renderGroups();
     }
+  }
+
+  if (target.dataset.addKeywordMembers) {
+    const groupIndex = Number(target.dataset.addKeywordMembers);
+    const keywordsText = String(state.groups[groupIndex].keywords || '').trim();
+    if (!keywordsText) {
+      setStatus('请先输入关键词', 'error');
+      return;
+    }
+    const added = addMatchingGroupMembers(groupIndex, keywordsText);
+    if (added > 0) {
+      setStatus(`已按关键词添加 ${added} 个节点到节点组`, 'success');
+    } else {
+      setStatus('没有节点名称包含这些关键词', 'idle');
+    }
+    renderGroups();
   }
 
   if (target.dataset.addChainMember) {

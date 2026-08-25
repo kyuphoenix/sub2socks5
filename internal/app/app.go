@@ -224,6 +224,7 @@ func (a *App) runSubscriptionAutoUpdate(now time.Time) {
 		a.subState = state
 		a.autoUpdateLastRun[key] = now
 		a.appendRuntimeLog("auto update completed (simultaneous)")
+		a.applyGroupKeywordRulesLocked()
 		return
 	}
 
@@ -274,6 +275,7 @@ func (a *App) runSubscriptionAutoUpdate(now time.Time) {
 		a.subState = merged
 		a.autoUpdateLastRun[key] = now
 		a.appendRuntimeLog(fmt.Sprintf("auto update completed (independent #%d)", idx+1))
+		a.applyGroupKeywordRulesLocked()
 		a.mu.Unlock()
 	}
 }
@@ -450,7 +452,81 @@ func (a *App) refreshSubscription(ctx context.Context, reason string) (map[strin
 	}
 	a.subState = state
 	a.appendRuntimeLog("subscription refreshed: " + reason)
+	a.applyGroupKeywordRulesLocked()
 	return cloneMap(state), nil
+}
+
+func (a *App) applyGroupKeywordRulesLocked() {
+	if err := a.applyGroupKeywordRules(); err != nil {
+		a.appendRuntimeLog("apply group keyword rules: " + err.Error())
+	}
+}
+
+// applyGroupKeywordRules must be called with a.mu held. It recomputes each
+// node group's members from its comma-separated keyword rule against the
+// currently available base nodes and persists the config only when the matched
+// node set actually changed.
+func (a *App) applyGroupKeywordRules() error {
+	cfg := a.cfg
+	nr := getMap(cfg, "nodeRegistry")
+	groups := getSlice(nr, "groups")
+	if len(groups) == 0 {
+		return nil
+	}
+
+	baseTags := []string{}
+	seen := map[string]bool{}
+	addBase := func(m map[string]any) {
+		if t := strings.TrimSpace(mustStr(m["tag"])); t != "" && !seen[t] {
+			seen[t] = true
+			baseTags = append(baseTags, t)
+		}
+	}
+	for _, n := range getSlice(a.subState, "nodes") {
+		if m, ok := n.(map[string]any); ok {
+			addBase(m)
+		}
+	}
+	for _, n := range getSlice(nr, "manualNodes") {
+		if m, ok := n.(map[string]any); ok {
+			addBase(m)
+		}
+	}
+
+	changed := false
+	for _, raw := range groups {
+		g, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		keywords := splitKeywords(mustStr(g["keywords"]))
+		if len(keywords) == 0 {
+			continue
+		}
+		matched := []string{}
+		for _, t := range baseTags {
+			if keywordMatchesAny(t, keywords) {
+				matched = append(matched, t)
+			}
+		}
+		if sameTagSetToStrings(currentGroupMembers(g), matched) {
+			continue
+		}
+		members := make([]any, 0, len(matched))
+		for _, s := range matched {
+			members = append(members, s)
+		}
+		g["members"] = members
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	if err := writeJSON(filepath.Join(a.dataDir, "app-config.json"), cfg); err != nil {
+		return err
+	}
+	a.appendRuntimeLog("applied group keyword rules after subscription refresh")
+	return nil
 }
 
 func subscriptionFetchFailure(result subscriptionFetchResult) error {
@@ -2635,6 +2711,57 @@ func toStringSet(in []any) map[string]bool {
 		out[mustStr(v)] = true
 	}
 	return out
+}
+
+func splitKeywords(s string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, part := range strings.Split(s, ",") {
+		k := strings.TrimSpace(part)
+		if k != "" && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+func keywordMatchesAny(name string, keywords []string) bool {
+	for _, k := range keywords {
+		if strings.Contains(name, k) {
+			return true
+		}
+	}
+	return false
+}
+
+func currentGroupMembers(g map[string]any) []string {
+	out := []string{}
+	for _, m := range getSlice(g, "members") {
+		if s := strings.TrimSpace(mustStr(m)); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// sameTagSetToStrings reports whether two tag lists contain the same set of
+// elements, ignoring order and duplicates.
+func sameTagSetToStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]int, len(a))
+	for _, s := range a {
+		set[s]++
+	}
+	for _, s := range b {
+		set[s]--
+		if set[s] < 0 {
+			return false
+		}
+	}
+	return true
 }
 func padBase64(s string) string {
 	s = strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(s), "-", "+"), "_", "/")
