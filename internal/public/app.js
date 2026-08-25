@@ -36,6 +36,7 @@ const socksConfigOverlay = document.getElementById('socks-config-overlay');
 const socksConfigStep = document.getElementById('socks-config-step');
 const socksConfigProgress = document.getElementById('socks-config-progress');
 const socksConfigDetail = document.getElementById('socks-config-detail');
+const socksConfigErrorEl = document.getElementById('socks-config-error');
 const cancelSocksConfigButton = document.getElementById('cancel-socks-config');
 const subAutoUpdateOverlay = document.getElementById('sub-auto-update-overlay');
 const subAutoScopeWrap = document.getElementById('sub-auto-scope-wrap');
@@ -720,7 +721,6 @@ async function autoConfigureSocksServicesFromOutbounds() {
   const outbounds = (latestData.availableOutbounds || [])
     .filter((item) => item && item.tag && !['proxy', 'auto', 'block', 'direct'].includes(item.tag));
   if (!outbounds.length) {
-    hideSocksConfigOverlay();
     socksConfigAbortController = null;
     throw new Error('当前没有可用节点可用于配置 SOCKS5 服务');
   }
@@ -736,7 +736,6 @@ async function autoConfigureSocksServicesFromOutbounds() {
     updateSocksConfigOverlay('节点延迟测试', 0, outbounds.length, '正在批量测试节点延迟...');
     connectivity = await checkOutboundsConnectivity(outbounds.map((item) => item.tag));
   } catch (error) {
-    hideSocksConfigOverlay();
     socksConfigAbortController = null;
     throw new Error(`延迟测试前准备失败：${error.message}`);
   } finally {
@@ -746,7 +745,6 @@ async function autoConfigureSocksServicesFromOutbounds() {
   }
   const passedOutbounds = outbounds.filter((item) => connectivity[item.tag]?.ok);
   if (!passedOutbounds.length) {
-    hideSocksConfigOverlay();
     socksConfigAbortController = null;
     throw new Error('没有通过延迟测试的节点，未创建 SOCKS5 服务');
   }
@@ -940,9 +938,31 @@ function mergeGeneratedGroups(existingGroups, generatedGroups) {
 
 function showSocksConfigOverlay(step, current, total, detail) {
   if (!socksConfigOverlay) return;
+  clearSocksConfigError();
   updateSocksConfigOverlay(step, current, total, detail);
   socksConfigOverlay.classList.remove('is-hidden');
   socksConfigOverlay.setAttribute('aria-hidden', 'false');
+}
+
+function clearSocksConfigError() {
+  if (socksConfigErrorEl) socksConfigErrorEl.classList.add('is-hidden');
+}
+
+function showSocksConfigError(message) {
+  if (!socksConfigOverlay) return;
+  if (socksConfigStep) socksConfigStep.textContent = '步骤：失败';
+  if (socksConfigProgress) socksConfigProgress.textContent = '— / —';
+  if (socksConfigDetail) socksConfigDetail.textContent = '';
+  if (socksConfigErrorEl) {
+    socksConfigErrorEl.classList.remove('is-hidden');
+    socksConfigErrorEl.textContent = message || '未知错误';
+  }
+  socksConfigOverlay.classList.remove('is-hidden');
+  socksConfigOverlay.setAttribute('aria-hidden', 'false');
+}
+
+function isSocksConfigCancellation(error) {
+  return error?.name === 'AbortError' || error?.message === '用户取消了操作';
 }
 
 function updateSocksConfigOverlay(step, current, total, detail) {
@@ -1471,17 +1491,29 @@ async function runSubscriptionRefreshFlow() {
     return;
   }
 
-  await autoConfigureSocksServicesFromOutbounds();
-  const parsed = parseFormConfig(true);
-  if (!parsed.ok) throw new Error(parsed.error);
-  editor.value = parsed.text;
-  await post('/api/config', parsed.value);
-  lastSavedConfigText = parsed.text;
-  formTouched = false;
-  fillForm(parsed.value);
-  renderSubscriptionUrls();
-  renderSocksServices();
-  updateEditorState();
+  try {
+    await autoConfigureSocksServicesFromOutbounds();
+    const parsed = parseFormConfig(true);
+    if (!parsed.ok) throw new Error(parsed.error);
+    editor.value = parsed.text;
+    await post('/api/config', parsed.value);
+    lastSavedConfigText = parsed.text;
+    formTouched = false;
+    fillForm(parsed.value);
+    renderSubscriptionUrls();
+    renderSocksServices();
+    updateEditorState();
+    hideSocksConfigOverlay();
+  } catch (error) {
+    if (isSocksConfigCancellation(error)) {
+      hideSocksConfigOverlay();
+    } else {
+      showSocksConfigError(error?.message || String(error));
+    }
+    throw error;
+  } finally {
+    socksConfigAbortController = null;
+  }
 }
 
 async function applySelectedArchitectureAndLoadReleases() {
@@ -1712,8 +1744,15 @@ autoConfigureSocksButton?.addEventListener('click', () => action('一键配置 S
     renderSubscriptionUrls();
     renderSocksServices();
     updateEditorState();
-  } finally {
     hideSocksConfigOverlay();
+  } catch (error) {
+    if (isSocksConfigCancellation(error)) {
+      hideSocksConfigOverlay();
+    } else {
+      showSocksConfigError(error?.message || String(error));
+    }
+    throw error;
+  } finally {
     socksConfigAbortController = null;
   }
 }));
