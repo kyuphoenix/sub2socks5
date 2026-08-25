@@ -71,7 +71,10 @@ function render() {
       <div class="socks-service-content">
         <div class="socks-service-card-heading">
           <div class="title">SOCKS5 服务 ${index + 1}</div>
-          <button type="button" class="copy-service-button" data-copy-port="${index}">复制</button>
+          <div class="socks-card-actions">
+            <button type="button" class="copy-service-button" data-test-port="${index}">测试</button>
+            <button type="button" class="copy-service-button" data-copy-port="${index}">复制</button>
+          </div>
         </div>
         <div class="form-grid socks-service-grid">
           <label>
@@ -255,6 +258,16 @@ document.addEventListener('click', (event) => {
       render();
     }
   }
+  if (target.dataset.testPort) {
+    const index = Number(target.dataset.testPort);
+    const p = formPorts[index];
+    if (p && p.listen && p.port) {
+      currentTest = { host: p.listen, port: Number(p.port) };
+      showSocksTestOverlay();
+    } else {
+      showToast('请先填写端口再测试', false);
+    }
+  }
   if (target.dataset.copyPort) {
     const index = Number(target.dataset.copyPort);
     const p = formPorts[index];
@@ -264,6 +277,82 @@ document.addEventListener('click', (event) => {
         () => showToast('复制失败', false)
       );
     }
+  }
+});
+
+const socksTestOverlay = document.getElementById('socks-test-overlay');
+const socksTestStep = document.getElementById('socks-test-step');
+const socksTestDetail = document.getElementById('socks-test-detail');
+const socksTestSource = document.getElementById('socks-test-source');
+const socksTestStart = document.getElementById('socks-test-start');
+
+let currentTest = null; // { host, port }
+let testing = false;
+
+function showSocksTestOverlay() {
+  if (!socksTestOverlay) return;
+  if (socksTestStep) socksTestStep.textContent = '选择测试 API';
+  if (socksTestDetail) socksTestDetail.textContent = '';
+  if (socksTestStart) socksTestStart.textContent = '开始测试';
+  if (socksTestStart) socksTestStart.disabled = false;
+  testing = false;
+  socksTestOverlay.classList.remove('is-hidden');
+  socksTestOverlay.setAttribute('aria-hidden', 'false');
+  socksTestSource?.focus();
+}
+
+function hideSocksTestOverlay() {
+  if (!socksTestOverlay) return;
+  if (testing) return;
+  socksTestOverlay.classList.add('is-hidden');
+  socksTestOverlay.setAttribute('aria-hidden', 'true');
+  currentTest = null;
+}
+
+async function runSocksTest() {
+  if (!currentTest) return;
+  testing = true;
+  if (socksTestStart) socksTestStart.disabled = true;
+  if (socksTestStart) socksTestStart.textContent = '测试中...';
+  const { host, port } = currentTest;
+  const source = socksTestSource?.value || 'api.ipify.org';
+  if (socksTestStep) socksTestStep.textContent = '正在查询出口 IP...';
+  if (socksTestDetail) socksTestDetail.textContent = `正在通过 ${host}:${port} 访问 ${source}...`;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    const response = await fetch('/api/socks5/test', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ listen: host, port, timeoutMs: 8000, source }),
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data?.error?.message || '测试失败');
+    }
+    if (socksTestStep) socksTestStep.textContent = `出口 IP：${data.ip}`;
+    if (socksTestDetail) socksTestDetail.textContent = `通过 ${host}:${port} 从 ${source} 查询到 ${data.ip}。`;
+  } catch (error) {
+    if (socksTestStep) socksTestStep.textContent = '测试失败';
+    if (socksTestDetail) socksTestDetail.textContent = `无法通过 ${host}:${port} 获取出口 IP：${error.message}`;
+  } finally {
+    if (socksTestStart) socksTestStart.textContent = '重新测试';
+    if (socksTestStart) socksTestStart.disabled = false;
+    testing = false;
+  }
+}
+
+socksTestStart?.addEventListener('click', runSocksTest);
+document.getElementById('socks-test-close')?.addEventListener('click', hideSocksTestOverlay);
+socksTestOverlay?.addEventListener('click', (event) => {
+  if (event.target === socksTestOverlay) hideSocksTestOverlay();
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && socksTestOverlay && !socksTestOverlay.classList.contains('is-hidden')) {
+    hideSocksTestOverlay();
   }
 });
 

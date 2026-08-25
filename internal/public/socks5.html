@@ -32,6 +32,27 @@
       <div id="socks-list"></div>
     </section>
   </main>
+
+  <div id="socks-test-overlay" class="overlay is-hidden" aria-hidden="true">
+    <div class="overlay-card">
+      <h3>测试 SOCKS5 服务</h3>
+      <div class="overlay-step" id="socks-test-step">选择测试 API</div>
+      <label class="socks-test-target">
+        <span>测试 API</span>
+        <select id="socks-test-source">
+          <option value="api.ipify.org">api.ipify.org</option>
+          <option value="ifconfig.me">ifconfig.me</option>
+          <option value="ip.sb">ip.sb</option>
+          <option value="icanhazip.com">icanhazip.com</option>
+        </select>
+      </label>
+      <div class="overlay-detail" id="socks-test-detail"></div>
+      <div class="overlay-actions">
+        <button id="socks-test-start" type="button">开始测试</button>
+        <button id="socks-test-close" type="button" class="danger-icon-button">取消</button>
+      </div>
+    </div>
+  </div>
   <script type="module" src="/socks5.js"></script>
 </body>
 </html>

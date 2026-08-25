@@ -1123,6 +1123,21 @@ textarea,
   margin: 0;
 }
 
+.socks-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.socks-test-target {
+  display: block;
+  margin-bottom: 12px;
+}
+
+.socks-test-target select {
+  width: 100%;
+}
+
 .copy-service-button {
   min-width: 64px;
   min-height: 34px;

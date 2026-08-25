@@ -131,6 +131,7 @@ func newHTTPHandler(app *App) http.Handler {
 	mux.HandleFunc("/api/nodes/delays", app.handleNodeDelays)
 	mux.HandleFunc("/api/nodes/egress", app.handleNodesEgress)
 	mux.HandleFunc("/api/ports/next", app.handleNextPort)
+	mux.HandleFunc("/api/socks5/test", app.handleSocks5Test)
 	mux.HandleFunc("/api/runtime/generate", app.handleRuntimeGenerate)
 	mux.HandleFunc("/api/runtime/start", app.handleRuntimeStart)
 	mux.HandleFunc("/api/runtime/stop", app.handleRuntimeStop)
@@ -798,6 +799,38 @@ func (a *App) handleNextPort(w http.ResponseWriter, r *http.Request) {
 	}
 	p := findPort(host, start)
 	ok(w, map[string]any{"host": host, "port": p})
+}
+
+func (a *App) handleSocks5Test(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	var body map[string]any
+	if err := decodeJSON(r.Body, &body); err != nil {
+		failDecodeJSON(w, err)
+		return
+	}
+	host := strings.TrimSpace(mustStr(body["listen"]))
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := int(toFloat(body["port"]))
+	if port <= 0 {
+		fail(w, 400, "Invalid socks5 port")
+		return
+	}
+	timeout := int(toFloat(body["timeoutMs"]))
+	if timeout <= 0 {
+		timeout = 8000
+	}
+	source := strings.TrimSpace(mustStr(body["source"]))
+	ip, err := fetchIPViaSocks(host, port, source, timeout)
+	if err != nil {
+		fail(w, http.StatusBadGateway, "查询出口 IP 失败："+err.Error())
+		return
+	}
+	ok(w, map[string]any{"ok": true, "ip": ip, "source": source})
 }
 
 func (a *App) handleRuntimeGenerate(w http.ResponseWriter, r *http.Request) {
@@ -1609,7 +1642,7 @@ func (a *App) handleNodesEgress(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		time.Sleep(120 * time.Millisecond)
-		ip, ipErr := fetchIPViaSocks(host, port, timeout)
+		ip, ipErr := fetchIPViaSocks(host, port, "", timeout)
 		if ipErr != nil {
 			results[tag] = map[string]any{"ok": false, "error": ipErr.Error()}
 			continue
@@ -1663,15 +1696,28 @@ func clashSelectProxy(groupTag, selectedTag string, timeoutMs int) error {
 	return nil
 }
 
-func fetchIPViaSocks(socksHost string, socksPort int, timeoutMs int) (string, error) {
+func fetchIPViaSocks(socksHost string, socksPort int, source string, timeoutMs int) (string, error) {
 	targets := []struct {
+		id   string
 		host string
 		path string
 	}{
-		{host: "api.ipify.org", path: "/?format=text"},
-		{host: "ipv4.icanhazip.com", path: "/"},
-		{host: "ifconfig.me", path: "/ip"},
-		{host: "api.ip.sb", path: "/ip"},
+		{id: "api.ipify.org", host: "api.ipify.org", path: "/?format=text"},
+		{id: "ipv4.icanhazip.com", host: "ipv4.icanhazip.com", path: "/"},
+		{id: "ifconfig.me", host: "ifconfig.me", path: "/ip"},
+		{id: "ip.sb", host: "api.ip.sb", path: "/ip"},
+	}
+	if source != "" {
+		filtered := targets[:0]
+		for _, t := range targets {
+			if strings.EqualFold(t.id, source) || strings.Contains(t.host, source) {
+				filtered = append(filtered, t)
+			}
+		}
+		targets = filtered
+		if len(targets) == 0 {
+			return "", fmt.Errorf("unknown source %q", source)
+		}
 	}
 
 	var lastErr error
