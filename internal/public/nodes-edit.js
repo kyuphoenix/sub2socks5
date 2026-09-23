@@ -230,6 +230,10 @@ async function load() {
     throw new Error(data?.error?.message || '加载节点失败');
   }
   state = data;
+  const appVersionEl = document.getElementById('app-version');
+  if (appVersionEl && (data.displayVersion || data.appVersion)) {
+    appVersionEl.textContent = data.displayVersion || ('v' + data.appVersion);
+  }
   render();
 }
 

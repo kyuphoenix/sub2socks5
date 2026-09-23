@@ -144,3 +144,8 @@ go build ./...
 - sing-box 仓库：https://github.com/SagerNet/sing-box
 - sing-box Releases：https://github.com/SagerNet/sing-box/releases
 - v2rayN（解析兼容参考）：https://github.com/2dust/v2rayN
+
+---
+
+## 社区
+Linux DO : https://linux.do/

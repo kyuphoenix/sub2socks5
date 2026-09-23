@@ -2,13 +2,10 @@ name: Release
 
 on:
   workflow_dispatch:
-    inputs:
-      release_version:
-        description: "Release version (example: v1.0.0)"
-        required: true
 
 jobs:
   build:
+    name: Build Binaries
     uses: ./.github/workflows/reusable-build.yml
     with:
       package_zip: true
@@ -21,19 +18,31 @@ jobs:
       contents: write
 
     steps:
-      - name: Resolve release metadata
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata from version file
         id: meta
         shell: bash
         run: |
-          VERSION="${{ github.event.inputs.release_version }}"
-          VERSION="$(echo "$VERSION" | tr -d '[:space:]')"
-          if [ -z "$VERSION" ]; then
-            echo "release_version is required"
+          if [ ! -f version ]; then
+            echo "Error: version file not found in repository root"
             exit 1
           fi
-          TAG="$VERSION"
-          NAME="sub2socks5 $VERSION"
+          RAW_VERSION=$(cat version | tr -d '[:space:]')
+          if [ -z "$RAW_VERSION" ]; then
+            echo "Error: version file is empty"
+            exit 1
+          fi
 
+          if [[ "$RAW_VERSION" =~ ^[vV] ]]; then
+            TAG="$RAW_VERSION"
+          else
+            TAG="v$RAW_VERSION"
+          fi
+          NAME="sub2socks5 $TAG"
+
+          echo "Detected version from repository: $RAW_VERSION"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 

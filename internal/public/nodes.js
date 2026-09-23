@@ -45,6 +45,10 @@ async function load() {
     fallbackStates: data.fallbackStates || {}
   };
   mergeNodeDelayResults(data.nodeDelays);
+  const appVersionEl = document.getElementById('app-version');
+  if (appVersionEl && (data.displayVersion || data.appVersion)) {
+    appVersionEl.textContent = data.displayVersion || `v${data.appVersion}`;
+  }
   render();
 }
 

@@ -19,6 +19,10 @@ async function load() {
   formPorts = normalizePorts(fullConfig.ports || []);
   await assignMissingSuggestedPorts();
   savedPortsSnapshot = JSON.parse(JSON.stringify(formPorts));
+  const appVersionEl = document.getElementById('app-version');
+  if (appVersionEl && (data.displayVersion || data.appVersion)) {
+    appVersionEl.textContent = data.displayVersion || `v${data.appVersion}`;
+  }
   render();
 }
 

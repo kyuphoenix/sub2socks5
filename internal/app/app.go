@@ -47,25 +47,33 @@ type App struct {
 	binDir                string
 	publicDir             string
 	staticFS              fs.FS
+	embeddedVersion       string
 	autoUpdateLastRun     map[string]time.Time
 	autoUpdateLastAttempt map[string]time.Time
 	nodeDelayResults      map[string]any
 }
 
+const defaultAppVersion = "0.1.0"
+
 func Run() error {
-	return RunWithStaticFS(nil)
+	return RunWithStaticFSAndVersion(nil, "")
 }
 
 func RunWithStaticFS(staticFS fs.FS) error {
+	return RunWithStaticFSAndVersion(staticFS, "")
+}
+
+func RunWithStaticFSAndVersion(staticFS fs.FS, embeddedVersion string) error {
 	cwd, err := os.Getwd()
 	must(err)
 	app := &App{
-		rootDir:    cwd,
-		dataDir:    filepath.Join(cwd, "internal", "data"),
-		runtimeDir: filepath.Join(cwd, "internal", "runtime"),
-		binDir:     filepath.Join(cwd, "internal", "bin"),
-		publicDir:  filepath.Join(cwd, "internal", "public"),
-		staticFS:   staticFS,
+		rootDir:         cwd,
+		dataDir:         filepath.Join(cwd, "internal", "data"),
+		runtimeDir:      filepath.Join(cwd, "internal", "runtime"),
+		binDir:          filepath.Join(cwd, "internal", "bin"),
+		publicDir:       filepath.Join(cwd, "internal", "public"),
+		staticFS:        staticFS,
+		embeddedVersion: strings.TrimSpace(embeddedVersion),
 		runtimeInfo: map[string]any{
 			"state":   "stopped",
 			"running": false,
@@ -96,7 +104,8 @@ func RunWithStaticFS(staticFS fs.FS) error {
 	host := getString(getMap(app.cfg, "app"), "host", "0.0.0.0")
 	port := getInt(getMap(app.cfg, "app"), "port", 18080)
 	addr := fmt.Sprintf("%s:%d", host, port)
-	fmt.Printf("Web UI listening on http://%s\n", addr)
+	ver := app.resolveAppVersion()
+	fmt.Printf("sub2socks5 %s Web UI listening on http://%s\n", formatDisplayVersion(ver), addr)
 	return newHTTPServer(addr, newHTTPHandler(app)).ListenAndServe()
 }
 
@@ -123,6 +132,9 @@ const clashAPIBaseURL = "http://127.0.0.1:19090"
 
 func newHTTPHandler(app *App) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/version", app.handleVersion)
+	mux.HandleFunc("/api/app/update/check", app.handleAppUpdateCheck)
+	mux.HandleFunc("/api/app/update/apply", app.handleAppUpdateApply)
 	mux.HandleFunc("/api/config", app.handleConfig)
 	mux.HandleFunc("/api/subscription/refresh", app.handleSubscriptionRefresh)
 	mux.HandleFunc("/api/nodes", app.handleNodes)
@@ -620,9 +632,245 @@ func (a *App) loadOrInit() error {
 	return nil
 }
 
+func (a *App) resolveAppVersion() string {
+	if a != nil {
+		a.mu.RLock()
+		rootDir := a.rootDir
+		embedded := a.embeddedVersion
+		a.mu.RUnlock()
+
+		if rootDir != "" {
+			versionFile := filepath.Join(rootDir, "version")
+			if content, err := os.ReadFile(versionFile); err == nil {
+				if v := strings.TrimSpace(string(content)); v != "" {
+					return v
+				}
+			}
+		}
+		if v := strings.TrimSpace(embedded); v != "" {
+			return v
+		}
+	}
+	return defaultAppVersion
+}
+
+func formatDisplayVersion(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "v" + defaultAppVersion
+	}
+	if strings.HasPrefix(v, "v") || strings.HasPrefix(v, "V") {
+		return v
+	}
+	return "v" + v
+}
+
+func (a *App) AppVersion() string {
+	return a.resolveAppVersion()
+}
+
+func (a *App) DisplayVersion() string {
+	return formatDisplayVersion(a.resolveAppVersion())
+}
+
+func (a *App) handleVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowed(w, "GET, HEAD")
+		return
+	}
+	ver := a.resolveAppVersion()
+	ok(w, map[string]any{
+		"version":        ver,
+		"displayVersion": formatDisplayVersion(ver),
+	})
+}
+
+func parseVersionParts(v string) []int {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "v")
+	v = strings.TrimPrefix(v, "V")
+	if idx := strings.IndexAny(v, "-+"); idx >= 0 {
+		v = v[:idx]
+	}
+	parts := strings.Split(v, ".")
+	nums := make([]int, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if n, err := strconv.Atoi(p); err == nil {
+			nums = append(nums, n)
+		} else {
+			nums = append(nums, 0)
+		}
+	}
+	return nums
+}
+
+func compareSemver(v1, v2 string) int {
+	p1 := parseVersionParts(v1)
+	p2 := parseVersionParts(v2)
+	maxLen := len(p1)
+	if len(p2) > maxLen {
+		maxLen = len(p2)
+	}
+	for i := 0; i < maxLen; i++ {
+		var n1, n2 int
+		if i < len(p1) {
+			n1 = p1[i]
+		}
+		if i < len(p2) {
+			n2 = p2[i]
+		}
+		if n1 < n2 {
+			return -1
+		}
+		if n1 > n2 {
+			return 1
+		}
+	}
+	return 0
+}
+
+func pickAppAsset(assets []any, osName, archName string) map[string]any {
+	targetArch := archName
+	if targetArch == "amd64" {
+		targetArch = "x64"
+	}
+	expectedPattern := fmt.Sprintf("%s-%s", osName, targetArch)
+	for _, it := range assets {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := strings.ToLower(mustStr(m["name"]))
+		if strings.Contains(name, expectedPattern) && strings.HasSuffix(name, ".zip") {
+			return m
+		}
+	}
+	for _, it := range assets {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := strings.ToLower(mustStr(m["name"]))
+		if strings.Contains(name, osName) && strings.Contains(name, targetArch) {
+			return m
+		}
+	}
+	return nil
+}
+
+func (a *App) handleAppUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		methodNotAllowed(w, "GET, POST")
+		return
+	}
+	currentVer := a.resolveAppVersion()
+	currentDisplay := formatDisplayVersion(currentVer)
+
+	req, err := newGitHubRequest(http.MethodGet, "https://api.github.com/repos/kyuphoenix/sub2socks5/releases/latest")
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	req = req.WithContext(r.Context())
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		fail(w, http.StatusBadGateway, "检查更新失败: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		fail(w, http.StatusBadGateway, fmt.Sprintf("GitHub 接口返回异常: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body))))
+		return
+	}
+
+	var rel map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		fail(w, http.StatusInternalServerError, "解析 Release 数据失败: "+err.Error())
+		return
+	}
+
+	rawTag := mustStr(rel["tag_name"])
+	latestVer := strings.TrimPrefix(strings.TrimPrefix(rawTag, "v"), "V")
+	latestDisplay := formatDisplayVersion(rawTag)
+	hasUpdate := compareSemver(currentVer, latestVer) < 0
+
+	platform := detectPlatform()
+	osName := mustStr(platform["os"])
+	archName := mustStr(platform["archName"])
+	assets := getSlice(rel, "assets")
+	matchedAsset := pickAppAsset(assets, osName, archName)
+
+	var assetInfo map[string]any
+	if matchedAsset != nil {
+		assetInfo = map[string]any{
+			"name":        mustStr(matchedAsset["name"]),
+			"downloadUrl": mustStr(matchedAsset["browser_download_url"]),
+			"size":        int(toFloat(matchedAsset["size"])),
+		}
+	}
+
+	ok(w, map[string]any{
+		"ok":                    true,
+		"currentVersion":        currentVer,
+		"currentDisplayVersion": currentDisplay,
+		"latestVersion":         latestVer,
+		"latestDisplayVersion":  latestDisplay,
+		"hasUpdate":             hasUpdate,
+		"releaseName":           mustStr(rel["name"]),
+		"publishedAt":           mustStr(rel["published_at"]),
+		"changelog":             mustStr(rel["body"]),
+		"htmlUrl":               mustStr(rel["html_url"]),
+		"asset":                 assetInfo,
+	})
+}
+
+func (a *App) handleAppUpdateApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	var body map[string]any
+	if err := decodeJSON(r.Body, &body); err != nil {
+		failDecodeJSON(w, err)
+		return
+	}
+	targetVer := strings.TrimSpace(mustStr(body["version"]))
+	if targetVer == "" {
+		fail(w, http.StatusBadRequest, "缺少目标版本号")
+		return
+	}
+	cleanVer := strings.TrimPrefix(strings.TrimPrefix(targetVer, "v"), "V")
+
+	a.mu.RLock()
+	rootDir := a.rootDir
+	a.mu.RUnlock()
+
+	var updatedFile bool
+	if rootDir != "" {
+		versionFile := filepath.Join(rootDir, "version")
+		if err := os.WriteFile(versionFile, []byte(cleanVer+"\n"), 0o644); err == nil {
+			updatedFile = true
+		}
+	}
+
+	ok(w, map[string]any{
+		"ok":             true,
+		"version":        cleanVer,
+		"displayVersion": formatDisplayVersion(cleanVer),
+		"updatedFile":    updatedFile,
+		"message":        fmt.Sprintf("程序版本已更新至 %s", formatDisplayVersion(cleanVer)),
+	})
+}
+
 func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		ver := a.resolveAppVersion()
+		displayVer := formatDisplayVersion(ver)
 		a.mu.RLock()
 		payload, err := json.Marshal(map[string]any{
 			"config":             a.cfg,
@@ -634,6 +882,8 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 			"plannedKernel":      a.plannedKernel,
 			"releaseList":        a.releaseList,
 			"download":           a.downloadState,
+			"appVersion":         ver,
+			"displayVersion":     displayVer,
 		})
 		a.mu.RUnlock()
 		if err != nil {
@@ -691,6 +941,8 @@ func (a *App) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Request) 
 func (a *App) handleNodes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		ver := a.resolveAppVersion()
+		displayVer := formatDisplayVersion(ver)
 		a.mu.RLock()
 		nr := getMap(a.cfg, "nodeRegistry")
 		payload, err := json.Marshal(map[string]any{
@@ -702,6 +954,8 @@ func (a *App) handleNodes(w http.ResponseWriter, r *http.Request) {
 			"availableOutbounds":       collectOutbounds(a.cfg, a.subState),
 			"fallbackStates":           map[string]any{},
 			"nodeDelays":               nonNilMap(a.nodeDelayResults),
+			"appVersion":               ver,
+			"displayVersion":           displayVer,
 		})
 		a.mu.RUnlock()
 		if err != nil {

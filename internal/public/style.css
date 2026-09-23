@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   --bg-page: #f0f2f5;
   --bg-page-soft: #e4e7ec;
   --text-main: #1a1a2e;
@@ -1086,6 +1086,30 @@ textarea,
   font-size: clamp(30px, 5vw, 46px);
   line-height: 1;
   letter-spacing: -0.035em;
+}
+
+.app-version-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--inner-card-bg);
+  color: var(--accent-strong);
+  border: 1px solid var(--card-border);
+  vertical-align: middle;
+  margin-left: 10px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.app-version-badge:hover {
+  background: var(--card-border);
+  transform: translateY(-1px);
 }
 
 .app-hero p {

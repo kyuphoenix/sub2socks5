@@ -1,4 +1,4 @@
-﻿const editor = document.getElementById('config-editor');
+const editor = document.getElementById('config-editor');
 const nodesEl = document.getElementById('nodes');
 
 const generatedEl = document.getElementById('generated');
@@ -75,6 +75,20 @@ const subAutoTargetsWrap = document.getElementById('sub-auto-targets-wrap');
 const subAutoTargetsEl = document.getElementById('sub-auto-targets');
 const saveSubAutoUpdateButton = document.getElementById('save-sub-auto-update');
 const cancelSubAutoUpdateButton = document.getElementById('cancel-sub-auto-update');
+
+const appUpdateOverlay = document.getElementById('app-update-overlay');
+const appUpdateBadge = document.getElementById('app-update-badge');
+const appUpdateCurrent = document.getElementById('app-update-current');
+const appUpdateLatest = document.getElementById('app-update-latest');
+const appUpdateTime = document.getElementById('app-update-time');
+const appUpdateChangelog = document.getElementById('app-update-changelog');
+const appUpdateAssetName = document.getElementById('app-update-asset-name');
+const appUpdateError = document.getElementById('app-update-error');
+const appUpdateApplyBtn = document.getElementById('app-update-apply-btn');
+const appUpdateDownloadBtn = document.getElementById('app-update-download-btn');
+const appUpdateReleaseBtn = document.getElementById('app-update-release-btn');
+const appUpdateRetryBtn = document.getElementById('app-update-retry-btn');
+const appUpdateCloseBtn = document.getElementById('app-update-close-btn');
 
 const tabPanels = {
   overview: document.getElementById('tab-overview'),
@@ -183,6 +197,10 @@ async function load() {
   }
 
   lastSavedConfigText = formattedConfig;
+  const appVersionEl = document.getElementById('app-version');
+  if (appVersionEl && (configData.displayVersion || configData.appVersion)) {
+    appVersionEl.textContent = configData.displayVersion || `v${configData.appVersion}`;
+  }
   updateEditorState();
   renderOverview();
 }
@@ -1579,9 +1597,150 @@ document.getElementById('kernel-check').onclick = () => action('检查内核版�
   await Promise.all([api('/api/kernel/status'), api('/api/kernel/releases')]);
 });
 
-kernelCheckUpdatesButton.onclick = () => action('检查版本更新', async () => {
-  await post('/api/kernel/releases/update');
+function openAppUpdateOverlay() {
+  if (appUpdateOverlay) {
+    appUpdateOverlay.classList.remove('is-hidden');
+    appUpdateOverlay.setAttribute('aria-hidden', 'false');
+  }
+}
+
+function closeAppUpdateOverlay() {
+  if (appUpdateOverlay) {
+    appUpdateOverlay.classList.add('is-hidden');
+    appUpdateOverlay.setAttribute('aria-hidden', 'true');
+  }
+}
+
+async function checkAppUpdates() {
+  openAppUpdateOverlay();
+  if (appUpdateBadge) {
+    appUpdateBadge.className = 'editor-status';
+    appUpdateBadge.textContent = '检查中...';
+  }
+  if (appUpdateError) appUpdateError.classList.add('is-hidden');
+  if (appUpdateApplyBtn) {
+    appUpdateApplyBtn.classList.add('is-hidden');
+    appUpdateApplyBtn.disabled = false;
+  }
+  if (appUpdateDownloadBtn) appUpdateDownloadBtn.classList.add('is-hidden');
+  if (appUpdateReleaseBtn) appUpdateReleaseBtn.classList.add('is-hidden');
+  if (appUpdateRetryBtn) appUpdateRetryBtn.classList.add('is-hidden');
+
+  const currentVerDisplay = document.getElementById('app-version')?.textContent || '0.1.0';
+  if (appUpdateCurrent) appUpdateCurrent.textContent = currentVerDisplay;
+  if (appUpdateLatest) appUpdateLatest.textContent = '正在查询 GitHub...';
+  if (appUpdateTime) appUpdateTime.textContent = '-';
+  if (appUpdateChangelog) appUpdateChangelog.textContent = '正在获取最新 Release 信息...';
+  if (appUpdateAssetName) appUpdateAssetName.textContent = '-';
+
+  try {
+    const res = await fetch('/api/app/update/check');
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data?.error?.message || '检查更新失败');
+    }
+
+    if (appUpdateCurrent) appUpdateCurrent.textContent = data.currentDisplayVersion || data.currentVersion || '-';
+    if (appUpdateLatest) appUpdateLatest.textContent = data.latestDisplayVersion || data.latestVersion || '-';
+    if (appUpdateTime) appUpdateTime.textContent = data.publishedAt ? new Date(data.publishedAt).toLocaleString() : '-';
+    if (appUpdateChangelog) appUpdateChangelog.textContent = data.changelog ? data.changelog.trim() : '无更新说明';
+
+    if (data.asset && data.asset.name) {
+      const sizeMb = data.asset.size ? ` (${(data.asset.size / (1024 * 1024)).toFixed(1)} MB)` : '';
+      if (appUpdateAssetName) appUpdateAssetName.textContent = `${data.asset.name}${sizeMb}`;
+      if (appUpdateDownloadBtn && data.asset.downloadUrl) {
+        appUpdateDownloadBtn.classList.remove('is-hidden');
+        appUpdateDownloadBtn.onclick = () => {
+          window.open(data.asset.downloadUrl, '_blank');
+        };
+      }
+    } else if (appUpdateAssetName) {
+      appUpdateAssetName.textContent = '未找到匹配当前系统的安装包';
+    }
+
+    if (appUpdateReleaseBtn && data.htmlUrl) {
+      appUpdateReleaseBtn.classList.remove('is-hidden');
+      appUpdateReleaseBtn.onclick = () => {
+        window.open(data.htmlUrl, '_blank');
+      };
+    }
+
+    if (data.hasUpdate) {
+      if (appUpdateBadge) {
+        appUpdateBadge.className = 'editor-status is-dirty';
+        appUpdateBadge.textContent = '发现新版本 (可更新)';
+      }
+      if (appUpdateApplyBtn) {
+        appUpdateApplyBtn.textContent = `在弹窗中更新至 ${data.latestDisplayVersion}`;
+        appUpdateApplyBtn.classList.remove('is-hidden');
+        appUpdateApplyBtn.onclick = async () => {
+          try {
+            appUpdateApplyBtn.disabled = true;
+            appUpdateApplyBtn.textContent = '正在更新...';
+            const applyRes = await fetch('/api/app/update/apply', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ version: data.latestVersion })
+            });
+            const applyData = await applyRes.json();
+            if (!applyRes.ok || !applyData.ok) {
+              throw new Error(applyData?.error?.message || '版本更新失败');
+            }
+            if (appUpdateBadge) {
+              appUpdateBadge.className = 'editor-status is-saved';
+              appUpdateBadge.textContent = '已更新至最新';
+            }
+            if (appUpdateCurrent) appUpdateCurrent.textContent = applyData.displayVersion;
+            const appVerEl = document.getElementById('app-version');
+            if (appVerEl) appVerEl.textContent = applyData.displayVersion;
+            appUpdateApplyBtn.classList.add('is-hidden');
+            setStatus(`程序版本已成功更新至 ${applyData.displayVersion}`, 'success');
+          } catch (err) {
+            if (appUpdateError) {
+              appUpdateError.textContent = `更新失败: ${err.message}`;
+              appUpdateError.classList.remove('is-hidden');
+            }
+            appUpdateApplyBtn.disabled = false;
+            appUpdateApplyBtn.textContent = `在弹窗中更新至 ${data.latestDisplayVersion}`;
+          }
+        };
+      }
+    } else {
+      if (appUpdateBadge) {
+        appUpdateBadge.className = 'editor-status is-saved';
+        appUpdateBadge.textContent = '已是最新版本';
+      }
+      if (appUpdateApplyBtn) appUpdateApplyBtn.classList.add('is-hidden');
+    }
+  } catch (err) {
+    if (appUpdateBadge) {
+      appUpdateBadge.className = 'editor-status is-dirty';
+      appUpdateBadge.textContent = '检查失败';
+    }
+    if (appUpdateLatest) appUpdateLatest.textContent = '获取失败';
+    if (appUpdateChangelog) appUpdateChangelog.textContent = '';
+    if (appUpdateError) {
+      appUpdateError.textContent = err.message;
+      appUpdateError.classList.remove('is-hidden');
+    }
+    if (appUpdateRetryBtn) appUpdateRetryBtn.classList.remove('is-hidden');
+  }
+}
+
+appUpdateCloseBtn?.addEventListener('click', closeAppUpdateOverlay);
+appUpdateRetryBtn?.addEventListener('click', () => {
+  checkAppUpdates();
 });
+appUpdateOverlay?.addEventListener('click', (e) => {
+  if (e.target === appUpdateOverlay) closeAppUpdateOverlay();
+});
+document.getElementById('app-version')?.addEventListener('click', () => {
+  checkAppUpdates();
+});
+
+kernelCheckUpdatesButton.onclick = () => {
+  checkAppUpdates();
+};
 
 kernelSelectVersionButton.onclick = () => action('设为计划版本', async () => {
   await applySelectedArchitectureAndLoadReleases();

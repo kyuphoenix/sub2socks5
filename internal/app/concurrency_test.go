@@ -34,6 +34,7 @@ func (w *blockingResponseWriter) Write(p []byte) (int, error) {
 func newConcurrencyTestApp(t *testing.T) *App {
 	t.Helper()
 	return &App{
+		rootDir: t.TempDir(),
 		cfg: map[string]any{
 			"app": map[string]any{},
 			"subscription": map[string]any{

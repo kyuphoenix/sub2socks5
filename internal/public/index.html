@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
@@ -11,7 +11,7 @@
   <main class="container">
     <div id="toast-container" class="toast-container" role="status" aria-live="polite"></div>
     <header class="app-hero">
-      <h1>sub2socks5</h1>
+      <h1>sub2socks5 <span id="app-version" class="app-version-badge" title="当前版本"></span></h1>
       <p>订阅转多端口 SOCKS5 管理面板</p>
     </header>
 
@@ -359,6 +359,42 @@
       </div>
     </div>
   </div>
+
+  <div id="app-update-overlay" class="overlay is-hidden" aria-hidden="true">
+    <div class="overlay-card" style="max-width: 580px;">
+      <div class="section-heading" style="margin-bottom: 14px;">
+        <h3 style="margin:0;">检查程序版本更新</h3>
+        <span id="app-update-badge" class="editor-status">检查中...</span>
+      </div>
+      <div id="app-update-content">
+        <div class="kv-grid" style="grid-template-columns: 100px 1fr; gap: 8px 12px; margin-bottom: 12px;">
+          <span style="color: var(--text-muted);">当前版本：</span>
+          <span id="app-update-current" style="font-weight: 600;">-</span>
+          <span style="color: var(--text-muted);">最新版本：</span>
+          <span id="app-update-latest" style="font-weight: 600;">-</span>
+          <span style="color: var(--text-muted);">发布时间：</span>
+          <span id="app-update-time">-</span>
+        </div>
+        <div id="app-update-changelog-wrap" style="margin-top: 10px;">
+          <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 4px;">更新说明：</div>
+          <pre id="app-update-changelog" style="min-height: 100px; max-height: 200px; font-size: 13px; white-space: pre-wrap; word-break: break-all; margin: 0;"></pre>
+        </div>
+        <div id="app-update-asset-wrap" style="margin-top: 10px; font-size: 13px; color: var(--text-muted);">
+          <span>系统安装包：</span>
+          <span id="app-update-asset-name" style="font-weight: 600; color: var(--text-main);">-</span>
+        </div>
+        <div id="app-update-error" class="editor-status is-dirty is-hidden" style="margin-top: 10px;"></div>
+      </div>
+      <div class="overlay-actions" style="margin-top: 16px; gap: 10px;">
+        <button id="app-update-apply-btn" type="button" class="is-hidden">在弹窗中更新版本</button>
+        <button id="app-update-download-btn" type="button" class="is-hidden">下载安装包</button>
+        <button id="app-update-release-btn" type="button" class="is-hidden">Release 详情</button>
+        <button id="app-update-retry-btn" type="button" class="is-hidden">重新检查</button>
+        <button id="app-update-close-btn" type="button" class="danger-icon-button">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <script type="module" src="/app.js"></script>
 </body>
 </html>
