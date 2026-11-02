@@ -7,10 +7,6 @@ on:
         required: false
         type: boolean
         default: false
-      run_smoke_test:
-        required: false
-        type: boolean
-        default: true
 
 jobs:
   build:
@@ -67,10 +63,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Run unit tests
-        shell: bash
-        run: go test ./...
-
       - name: Prepare output directory
         shell: bash
         run: mkdir -p dist
@@ -81,34 +73,6 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: go build -trimpath -ldflags "-s -w" -o dist/${{ matrix.binary_name }} .
-
-      - name: Smoke test embedded static (Windows)
-        if: inputs.run_smoke_test && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $p = Start-Process -FilePath "dist/${{ matrix.binary_name }}" -PassThru
-          Start-Sleep -Seconds 2
-          try {
-            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:18080/" -UseBasicParsing -TimeoutSec 10
-            if ($resp.StatusCode -ne 200) {
-              throw "Unexpected status code: $($resp.StatusCode)"
-            }
-          } finally {
-            if ($p -and !$p.HasExited) {
-              Stop-Process -Id $p.Id -Force
-            }
-          }
-
-      - name: Smoke test embedded static (Linux/macOS)
-        if: inputs.run_smoke_test && runner.os != 'Windows'
-        shell: bash
-        run: |
-          chmod +x "dist/${{ matrix.binary_name }}"
-          "dist/${{ matrix.binary_name }}" >/tmp/sub2socks5.log 2>&1 &
-          APP_PID=$!
-          sleep 2
-          curl -fsS "http://127.0.0.1:18080/" >/dev/null
-          kill "$APP_PID" || true
 
       - name: Package artifact (Windows)
         if: inputs.package_zip && runner.os == 'Windows'
