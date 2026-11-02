@@ -163,7 +163,7 @@ func TestCollectOutbounds_BasicPresence(t *testing.T) {
 		}
 		tags[mustStr(m["tag"])] = true
 	}
-	required := []string{"group-a", "chain-a", "manual-a", "sub-a", "proxy", "auto", "block"}
+	required := []string{"group-a", "chain-a", "manual-a", "sub-a", "direct", "proxy", "auto", "block"}
 	for _, tag := range required {
 		if !tags[tag] {
 			t.Fatalf("expected outbound tag %s not found", tag)
@@ -233,5 +233,128 @@ func TestBuildSingBoxConfig_ExcludesDisabledSubscriptionNodes(t *testing.T) {
 	}
 	if tags["sub-disabled"] {
 		t.Fatalf("disabled subscription node should not remain in sing-box config")
+	}
+}
+
+func TestBuildSingBoxConfig_SocksAuthAndDirectRouting(t *testing.T) {
+	cfg := map[string]any{
+		"app":     map[string]any{"logLevel": "info"},
+		"dns":     map[string]any{"strategy": "prefer_ipv4", "bootstrapServer": "1.1.1.1"},
+		"routing": map[string]any{"routeFinal": "proxy"},
+		"nodeRegistry": map[string]any{
+			"manualNodes": []any{},
+			"groups":      []any{},
+			"chains":      []any{},
+		},
+		"ports": []any{
+			map[string]any{"tag": "socks-noauth", "listen": "127.0.0.1", "port": 18081, "target": "direct"},
+			map[string]any{"tag": "socks-auth", "listen": "127.0.0.1", "port": 18082, "target": "proxy", "username": "user1", "password": "pass1"},
+		},
+	}
+	sub := map[string]any{"nodes": []any{}}
+
+	generated := buildSingBoxConfig(cfg, sub)
+	inbounds, _ := generated["inbounds"].([]any)
+	if len(inbounds) != 2 {
+		t.Fatalf("expected 2 inbounds, got %d", len(inbounds))
+	}
+
+	var noauthInbound, authInbound map[string]any
+	for _, item := range inbounds {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if mustStr(m["tag"]) == "socks-noauth" {
+			noauthInbound = m
+		}
+		if mustStr(m["tag"]) == "socks-auth" {
+			authInbound = m
+		}
+	}
+
+	if noauthInbound == nil || authInbound == nil {
+		t.Fatalf("failed to find expected inbounds: %#v", inbounds)
+	}
+
+	if _, hasUsers := noauthInbound["users"]; hasUsers {
+		t.Fatalf("inbound without username/password should not have users field: %#v", noauthInbound)
+	}
+
+	users, ok := authInbound["users"].([]any)
+	if !ok || len(users) != 1 {
+		t.Fatalf("expected 1 user in auth inbound, got %#v", authInbound["users"])
+	}
+	userMap, _ := users[0].(map[string]any)
+	if mustStr(userMap["username"]) != "user1" || mustStr(userMap["password"]) != "pass1" {
+		t.Fatalf("unexpected user credentials: %#v", userMap)
+	}
+
+	route, _ := generated["route"].(map[string]any)
+	rules, _ := route["rules"].([]any)
+	routeMap := map[string]string{}
+	for _, r := range rules {
+		rm, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		inboundsList, _ := rm["inbound"].([]any)
+		if len(inboundsList) > 0 {
+			routeMap[mustStr(inboundsList[0])] = mustStr(rm["outbound"])
+		}
+	}
+	if routeMap["socks-noauth"] != "direct" {
+		t.Fatalf("expected socks-noauth route to direct, got %s", routeMap["socks-noauth"])
+	}
+}
+
+func TestBuildSingBoxConfig_HTTPInboundAndRouting(t *testing.T) {
+	cfg := map[string]any{
+		"app":     map[string]any{"logLevel": "info"},
+		"dns":     map[string]any{"strategy": "prefer_ipv4", "bootstrapServer": "1.1.1.1"},
+		"routing": map[string]any{"routeFinal": "proxy"},
+		"nodeRegistry": map[string]any{
+			"manualNodes": []any{},
+			"groups":      []any{},
+			"chains":      []any{},
+		},
+		"ports": []any{
+			map[string]any{"type": "http", "tag": "http-1", "listen": "127.0.0.1", "port": 18083, "target": "proxy", "username": "httpuser", "password": "httppass"},
+		},
+	}
+	sub := map[string]any{"nodes": []any{}}
+
+	generated := buildSingBoxConfig(cfg, sub)
+	inbounds, _ := generated["inbounds"].([]any)
+	if len(inbounds) != 1 {
+		t.Fatalf("expected 1 inbound, got %d", len(inbounds))
+	}
+	m, ok := inbounds[0].(map[string]any)
+	if !ok {
+		t.Fatalf("inbound is not a map")
+	}
+	if mustStr(m["type"]) != "http" {
+		t.Fatalf("expected inbound type http, got %s", mustStr(m["type"]))
+	}
+	if mustStr(m["tag"]) != "http-1" {
+		t.Fatalf("expected inbound tag http-1, got %s", mustStr(m["tag"]))
+	}
+	users, ok := m["users"].([]any)
+	if !ok || len(users) != 1 {
+		t.Fatalf("expected users in http inbound, got %#v", m["users"])
+	}
+	userMap, _ := users[0].(map[string]any)
+	if mustStr(userMap["username"]) != "httpuser" || mustStr(userMap["password"]) != "httppass" {
+		t.Fatalf("unexpected http user: %#v", userMap)
+	}
+
+	route, _ := generated["route"].(map[string]any)
+	rules, _ := route["rules"].([]any)
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+	rm, _ := rules[0].(map[string]any)
+	if mustStr(rm["outbound"]) != "proxy" {
+		t.Fatalf("expected outbound proxy, got %s", mustStr(rm["outbound"]))
 	}
 }

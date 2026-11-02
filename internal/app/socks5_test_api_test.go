@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -92,6 +94,79 @@ func TestSocks5TestValidSourceFiltersTarget(t *testing.T) {
 	}
 	if mustStr(body["ip"]) != "203.0.113.7" {
 		t.Fatalf("unexpected ip: %v", body["ip"])
+	}
+}
+
+func TestSocks5TestWithAuthentication(t *testing.T) {
+	socksHost, socksPort := startFakeAuthSocksEchoServer(t, "testuser", "testpass")
+	app := newConcurrencyTestApp(t)
+	handler := newHTTPHandler(app)
+
+	// Valid auth
+	payload := fmt.Sprintf(`{"listen":%q,"port":%d,"source":"ifconfig.me","timeoutMs":1000,"username":"testuser","password":"testpass"}`, socksHost, socksPort)
+	req := httptest.NewRequest(http.MethodPost, "/api/socks5/test", bytes.NewBufferString(payload))
+	req.Header.Set("content-type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid json response: %v", err)
+	}
+	if mustStr(body["ip"]) != "198.51.100.1" {
+		t.Fatalf("unexpected ip: %v", body["ip"])
+	}
+
+	// Invalid auth
+	badPayload := fmt.Sprintf(`{"listen":%q,"port":%d,"source":"ifconfig.me","timeoutMs":1000,"username":"testuser","password":"wrongpass"}`, socksHost, socksPort)
+	reqBad := httptest.NewRequest(http.MethodPost, "/api/socks5/test", bytes.NewBufferString(badPayload))
+	reqBad.Header.Set("content-type", "application/json")
+	respBad := httptest.NewRecorder()
+	handler.ServeHTTP(respBad, reqBad)
+
+	if respBad.Code != http.StatusBadGateway {
+		t.Fatalf("expected status %d for invalid auth, got %d: %s", http.StatusBadGateway, respBad.Code, respBad.Body.String())
+	}
+}
+
+func TestProxyTestHTTPProxyWithAuthentication(t *testing.T) {
+	proxyHost, proxyPort := startFakeHTTPProxyServer(t, "httpuser", "httppass")
+	app := newConcurrencyTestApp(t)
+	handler := newHTTPHandler(app)
+
+	// Valid auth with type: "http"
+	payload := fmt.Sprintf(`{"listen":%q,"port":%d,"type":"http","source":"ifconfig.me","timeoutMs":1000,"username":"httpuser","password":"httppass"}`, proxyHost, proxyPort)
+	req := httptest.NewRequest(http.MethodPost, "/api/socks5/test", bytes.NewBufferString(payload))
+	req.Header.Set("content-type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, resp.Code, resp.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid json response: %v", err)
+	}
+	if mustStr(body["ip"]) != "198.51.100.2" {
+		t.Fatalf("unexpected ip: %v", body["ip"])
+	}
+	if mustStr(body["type"]) != "http" {
+		t.Fatalf("unexpected type: %v", body["type"])
+	}
+
+	// Invalid auth with type: "http"
+	badPayload := fmt.Sprintf(`{"listen":%q,"port":%d,"type":"http","source":"ifconfig.me","timeoutMs":1000,"username":"httpuser","password":"wrongpassword"}`, proxyHost, proxyPort)
+	reqBad := httptest.NewRequest(http.MethodPost, "/api/proxy/test", bytes.NewBufferString(badPayload))
+	reqBad.Header.Set("content-type", "application/json")
+	respBad := httptest.NewRecorder()
+	handler.ServeHTTP(respBad, reqBad)
+
+	if respBad.Code != http.StatusBadGateway {
+		t.Fatalf("expected status %d for invalid http auth, got %d: %s", http.StatusBadGateway, respBad.Code, respBad.Body.String())
 	}
 }
 
@@ -194,4 +269,166 @@ func readHTTPHeaders(r io.Reader) (string, error) {
 			return buf.String(), err
 		}
 	}
+}
+
+func startFakeAuthSocksEchoServer(t *testing.T, expectedUser, expectedPass string) (string, int) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleFakeAuthSocks(conn, expectedUser, expectedPass)
+		}
+	}()
+
+	host, portStr, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split addr failed: %v", err)
+	}
+	port, _ := strconv.Atoi(portStr)
+	return host, port
+}
+
+func handleFakeAuthSocks(conn net.Conn, expectedUser, expectedPass string) {
+	defer conn.Close()
+
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return
+	}
+	nmethods := int(header[1])
+	methods := make([]byte, nmethods)
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return
+	}
+
+	// Tell client to use username/password auth (0x02)
+	if _, err := conn.Write([]byte{0x05, 0x02}); err != nil {
+		return
+	}
+
+	// Read subnegotiation: [0x01, ulen, user..., plen, pass...]
+	subVer := make([]byte, 2)
+	if _, err := io.ReadFull(conn, subVer); err != nil {
+		return
+	}
+	uLen := int(subVer[1])
+	uBytes := make([]byte, uLen)
+	if _, err := io.ReadFull(conn, uBytes); err != nil {
+		return
+	}
+	pLenByte := make([]byte, 1)
+	if _, err := io.ReadFull(conn, pLenByte); err != nil {
+		return
+	}
+	pLen := int(pLenByte[0])
+	pBytes := make([]byte, pLen)
+	if _, err := io.ReadFull(conn, pBytes); err != nil {
+		return
+	}
+
+	if string(uBytes) != expectedUser || string(pBytes) != expectedPass {
+		_, _ = conn.Write([]byte{0x01, 0x01}) // auth fail
+		return
+	}
+	if _, err := conn.Write([]byte{0x01, 0x00}); err != nil { // auth success
+		return
+	}
+
+	// Consume connect request: ver(1) cmd(1) rsv(1) atyp(1)
+	prefix := make([]byte, 4)
+	if _, err := io.ReadFull(conn, prefix); err != nil {
+		return
+	}
+	atyp := prefix[3]
+	switch atyp {
+	case 0x01:
+		if _, err := io.CopyN(io.Discard, conn, 4+2); err != nil {
+			return
+		}
+	case 0x03:
+		length := make([]byte, 1)
+		if _, err := io.ReadFull(conn, length); err != nil {
+			return
+		}
+		if _, err := io.CopyN(io.Discard, conn, int64(length[0])+2); err != nil {
+			return
+		}
+	case 0x04:
+		if _, err := io.CopyN(io.Discard, conn, 16+2); err != nil {
+			return
+		}
+	default:
+		return
+	}
+
+	// Connect success reply (IPv4, port 0).
+	if _, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); err != nil {
+		return
+	}
+
+	// Consume HTTP request headers.
+	if _, err := readHTTPHeaders(conn); err != nil {
+		return
+	}
+
+	const body = "198.51.100.1\n"
+	resp := "HTTP/1.1 200 OK\r\nContent-Length: " + strconv.Itoa(len(body)) + "\r\nConnection: close\r\n\r\n" + body
+	_, _ = conn.Write([]byte(resp))
+}
+
+func startFakeHTTPProxyServer(t *testing.T, expectedUser, expectedPass string) (string, int) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleFakeHTTPProxy(conn, expectedUser, expectedPass)
+		}
+	}()
+
+	host, portStr, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split addr failed: %v", err)
+	}
+	port, _ := strconv.Atoi(portStr)
+	return host, port
+}
+
+func handleFakeHTTPProxy(conn net.Conn, expectedUser, expectedPass string) {
+	defer conn.Close()
+
+	headers, err := readHTTPHeaders(conn)
+	if err != nil {
+		return
+	}
+
+	if expectedUser != "" || expectedPass != "" {
+		expectedAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(expectedUser+":"+expectedPass))
+		if !strings.Contains(headers, "Proxy-Authorization: "+expectedAuth) {
+			resp := "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+			_, _ = conn.Write([]byte(resp))
+			return
+		}
+	}
+
+	const body = "198.51.100.2\n"
+	resp := "HTTP/1.1 200 OK\r\nContent-Length: " + strconv.Itoa(len(body)) + "\r\nConnection: close\r\n\r\n" + body
+	_, _ = conn.Write([]byte(resp))
 }

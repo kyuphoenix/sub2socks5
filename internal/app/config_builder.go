@@ -110,6 +110,7 @@ func collectOutbounds(cfg, sub map[string]any) []any {
 		}
 	}
 	builtins := []any{
+		map[string]any{"tag": "direct", "type": "direct", "source": "builtin", "label": "direct（直连）"},
 		map[string]any{"tag": "proxy", "type": "selector", "source": "builtin", "label": "proxy（自动选择）"},
 		map[string]any{"tag": "auto", "type": "urltest", "source": "builtin", "label": "auto（延迟测试）"},
 		map[string]any{"tag": "block", "type": "block", "source": "builtin", "label": "block"},
@@ -269,12 +270,27 @@ func buildSingBoxConfig(cfg, sub map[string]any) map[string]any {
 		listen := mustStr(pm["listen"])
 		listenPort := int(toFloat(pm["port"]))
 		target := strings.TrimSpace(mustStr(pm["target"]))
-		inbounds = append(inbounds, map[string]any{
-			"type":        "socks",
+		username := strings.TrimSpace(mustStr(pm["username"]))
+		password := strings.TrimSpace(mustStr(pm["password"]))
+		inboundType := strings.ToLower(strings.TrimSpace(mustStr(pm["type"])))
+		if inboundType != "http" {
+			inboundType = "socks"
+		}
+		inbound := map[string]any{
+			"type":        inboundType,
 			"tag":         inboundTag,
 			"listen":      listen,
 			"listen_port": listenPort,
-		})
+		}
+		if username != "" || password != "" {
+			inbound["users"] = []any{
+				map[string]any{
+					"username": username,
+					"password": password,
+				},
+			}
+		}
+		inbounds = append(inbounds, inbound)
 		if target == "" {
 			target = "proxy"
 		}

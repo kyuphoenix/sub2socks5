@@ -364,10 +364,18 @@ function renderSocksServices() {
   for (const [index, item] of formPorts.entries()) {
     const block = document.createElement('div');
     block.className = 'timeline-item';
+    const isHttp = item.type === 'http';
+    const serviceLabel = isHttp ? 'HTTP' : 'SOCKS5';
     block.innerHTML = `
-      <div class="title">SOCKS5 服务 ${index + 1}</div>
+      <div class="title">${serviceLabel} 服务 ${index + 1}</div>
       <div class="form-grid">
         <label><span>tag</span><input data-port-index="${index}" data-port-field="tag" value="${escapeHtmlAttr(item.tag || '')}" /></label>
+        <label><span>协议类型</span>
+          <select data-port-index="${index}" data-port-field="type">
+            <option value="socks" ${!isHttp ? 'selected' : ''}>SOCKS5</option>
+            <option value="http" ${isHttp ? 'selected' : ''}>HTTP</option>
+          </select>
+        </label>
         <label><span>监听地址</span><input data-port-index="${index}" data-port-field="listen" value="${escapeHtmlAttr(item.listen || '127.0.0.1')}" /></label>
         <label><span>端口</span><input data-port-index="${index}" data-port-field="port" type="number" min="1" step="1" value="${escapeHtmlAttr(item.port || '')}" /></label>
         <label><span>目标出口</span><select data-port-index="${index}" data-port-field="target">${buildOutboundOptionsHtml(item.target || 'proxy')}</select></label>
@@ -382,7 +390,7 @@ function renderSocksServices() {
 
   const actions = document.createElement('div');
   actions.className = 'section-heading-actions';
-  actions.innerHTML = '<button type="button" id="add-socks-service">+ 添加 SOCKS5 服务</button>';
+  actions.innerHTML = '<button type="button" id="add-socks-service">+ 添加 SOCKS5 服务</button><button type="button" id="add-http-service">+ 添加 HTTP 服务</button>';
   socksServicesEl.appendChild(actions);
 }
 
@@ -605,20 +613,31 @@ function parseFormConfig(validateRequired = false) {
       : fields.dnsBootstrapPreset.value;
     next.routing.routeFinal = fields.routeFinal.value || next.routing.routeFinal || 'proxy';
 
-    next.ports = formPorts.map((item, index) => ({
-      tag: item.tag?.trim() || `socks-${index + 1}`,
-      listen: item.listen?.trim() || '127.0.0.1',
-      port: Number(item.port || 0),
-      target: item.target || next.routing.routeFinal || 'proxy',
-      sniff: true
-    }));
+    next.ports = formPorts.map((item, index) => {
+      const isHttp = item.type === 'http';
+      const portObj = {
+        tag: item.tag?.trim() || `${isHttp ? 'http' : 'socks'}-${index + 1}`,
+        listen: item.listen?.trim() || '127.0.0.1',
+        port: Number(item.port || 0),
+        target: item.target || next.routing.routeFinal || 'proxy',
+        sniff: true
+      };
+      if (isHttp) {
+        portObj.type = 'http';
+      }
+      const username = item.username?.trim();
+      const password = item.password?.trim();
+      if (username) portObj.username = username;
+      if (password) portObj.password = password;
+      return portObj;
+    });
 
     if (validateRequired) {
       if (!next.app.host) throw new Error('Web UI 监听地址不能为空');
       if (!Number.isInteger(next.app.port) || next.app.port <= 0) throw new Error('Web UI 端口无效');
       if (!next.app.singBoxBinary) throw new Error('sing-box 二进制路径不能为空');
       if (!next.routing.routeFinal) throw new Error('默认路由出口不能为空');
-      if (!next.ports.length) throw new Error('至少需要一个 SOCKS5 服务');
+      if (!next.ports.length) throw new Error('至少需要一个代理服务');
       if (!next.dns.remoteUrl) throw new Error('DoH 地址不能为空');
 
       const seenSubUrls = new Set();
@@ -683,25 +702,36 @@ function fillForm(config) {
 
 function normalizePorts(ports) {
   if (!Array.isArray(ports) || !ports.length) {
-    return [createDefaultPort()];
+    return [createDefaultPort('socks')];
   }
 
-  return ports.map((item, index) => ({
-    tag: item.tag || `socks-${index + 1}`,
-    listen: item.listen || '127.0.0.1',
-    port: item.port || '',
-    target: item.target || 'proxy',
-    sniff: true
-  }));
+  return ports.map((item, index) => {
+    const isHttp = item.type === 'http';
+    return {
+      tag: item.tag || `${isHttp ? 'http' : 'socks'}-${index + 1}`,
+      type: isHttp ? 'http' : 'socks',
+      listen: item.listen || '127.0.0.1',
+      port: item.port || '',
+      target: item.target || 'proxy',
+      sniff: true,
+      username: item.username || '',
+      password: item.password || ''
+    };
+  });
 }
 
-function createDefaultPort() {
+function createDefaultPort(type = 'socks') {
+  const isHttp = type === 'http';
+  const normType = isHttp ? 'http' : 'socks';
   return {
-    tag: `socks-${formPorts.length + 1 || 1}`,
+    tag: `${normType}-${formPorts.length + 1 || 1}`,
+    type: normType,
     listen: '127.0.0.1',
     port: '',
     target: fields.routeFinal?.value || latestData.config?.routing?.routeFinal || 'proxy',
-    sniff: true
+    sniff: true,
+    username: '',
+    password: ''
   };
 }
 
@@ -845,7 +875,9 @@ async function autoConfigureSocksServicesFromOutbounds() {
       listen: host,
       port,
       target: item.tag,
-      sniff: true
+      sniff: true,
+      username: '',
+      password: ''
     });
   }
 
@@ -1040,10 +1072,30 @@ function renderCopySocksTabs() {
   copySocksCustomPanel?.classList.toggle('is-active', !isLines);
 }
 
+function formatProxyUrl(p) {
+  const isHttp = p.type === 'http';
+  const scheme = isHttp ? 'http' : 'socks5';
+  const host = p.listen || '127.0.0.1';
+  const port = p.port;
+  const username = (p.username || '').trim();
+  const password = (p.password || '').trim();
+  if (username && password) {
+    return `${scheme}://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}:${port}`;
+  }
+  if (username) {
+    return `${scheme}://${encodeURIComponent(username)}@${host}:${port}`;
+  }
+  if (password) {
+    return `${scheme}://:${encodeURIComponent(password)}@${host}:${port}`;
+  }
+  return `${scheme}://${host}:${port}`;
+}
+const formatSocksUrl = formatProxyUrl;
+
 function buildSocksAddressList() {
   return formPorts
     .filter((p) => p.listen && p.port)
-    .map((p) => `socks5://${p.listen}:${p.port}`);
+    .map((p) => formatProxyUrl(p));
 }
 
 function updateCopySocksPreviews() {
@@ -1780,13 +1832,13 @@ editSocksServiceButton?.addEventListener('click', () => {
 exportSocksButton?.addEventListener('click', () => {
   const lines = formPorts
     .filter(p => p.listen && p.port)
-    .map(p => `socks5://${p.listen}:${p.port}`);
+    .map(p => formatProxyUrl(p));
   const json = JSON.stringify(lines, null, 2);
   const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'socks5.json';
+  a.download = 'proxy-list.json';
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -2114,7 +2166,14 @@ document.addEventListener('click', (event) => {
   }
 
   if (target.id === 'add-socks-service') {
-    formPorts.push(createDefaultPort());
+    formPorts.push(createDefaultPort('socks'));
+    renderSocksServices();
+    formTouched = true;
+    updateEditorState();
+  }
+
+  if (target.id === 'add-http-service') {
+    formPorts.push(createDefaultPort('http'));
     renderSocksServices();
     formTouched = true;
     updateEditorState();

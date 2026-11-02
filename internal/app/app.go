@@ -3,6 +3,7 @@ package app
 import (
 	"archive/tar"
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -144,6 +145,7 @@ func newHTTPHandler(app *App) http.Handler {
 	mux.HandleFunc("/api/nodes/egress", app.handleNodesEgress)
 	mux.HandleFunc("/api/ports/next", app.handleNextPort)
 	mux.HandleFunc("/api/socks5/test", app.handleSocks5Test)
+	mux.HandleFunc("/api/proxy/test", app.handleSocks5Test)
 	mux.HandleFunc("/api/runtime/generate", app.handleRuntimeGenerate)
 	mux.HandleFunc("/api/runtime/start", app.handleRuntimeStart)
 	mux.HandleFunc("/api/runtime/stop", app.handleRuntimeStop)
@@ -1155,12 +1157,28 @@ func (a *App) handleSocks5Test(w http.ResponseWriter, r *http.Request) {
 		timeout = 8000
 	}
 	source := strings.TrimSpace(mustStr(body["source"]))
-	ip, err := fetchIPViaSocks(host, port, source, timeout)
+	username := strings.TrimSpace(mustStr(body["username"]))
+	password := strings.TrimSpace(mustStr(body["password"]))
+	proxyType := strings.ToLower(strings.TrimSpace(mustStr(body["type"])))
+	if proxyType == "" {
+		proxyType = strings.ToLower(strings.TrimSpace(mustStr(body["protocol"])))
+	}
+	if proxyType != "http" {
+		proxyType = "socks"
+	}
+
+	var ip string
+	var err error
+	if proxyType == "http" {
+		ip, err = fetchIPViaHTTP(host, port, source, timeout, username, password)
+	} else {
+		ip, err = fetchIPViaSocks(host, port, source, timeout, username, password)
+	}
 	if err != nil {
 		fail(w, http.StatusBadGateway, "查询出口 IP 失败："+err.Error())
 		return
 	}
-	ok(w, map[string]any{"ok": true, "ip": ip, "source": source})
+	ok(w, map[string]any{"ok": true, "ip": ip, "source": source, "type": proxyType})
 }
 
 func (a *App) handleRuntimeGenerate(w http.ResponseWriter, r *http.Request) {
@@ -2026,7 +2044,14 @@ func clashSelectProxy(groupTag, selectedTag string, timeoutMs int) error {
 	return nil
 }
 
-func fetchIPViaSocks(socksHost string, socksPort int, source string, timeoutMs int) (string, error) {
+func fetchIPViaSocks(socksHost string, socksPort int, source string, timeoutMs int, auth ...string) (string, error) {
+	var username, password string
+	if len(auth) > 0 {
+		username = auth[0]
+	}
+	if len(auth) > 1 {
+		password = auth[1]
+	}
 	targets := []struct {
 		id   string
 		host string
@@ -2052,7 +2077,7 @@ func fetchIPViaSocks(socksHost string, socksPort int, source string, timeoutMs i
 
 	var lastErr error
 	for _, target := range targets {
-		ip, err := fetchIPViaSocksTarget(socksHost, socksPort, timeoutMs, target.host, target.path)
+		ip, err := fetchIPViaSocksTarget(socksHost, socksPort, timeoutMs, target.host, target.path, username, password)
 		if err == nil && strings.TrimSpace(ip) != "" {
 			return strings.TrimSpace(ip), nil
 		}
@@ -2064,7 +2089,7 @@ func fetchIPViaSocks(socksHost string, socksPort int, source string, timeoutMs i
 	return "", fmt.Errorf("no egress ip endpoint available")
 }
 
-func fetchIPViaSocksTarget(socksHost string, socksPort int, timeoutMs int, domain string, reqPath string) (string, error) {
+func fetchIPViaSocksTarget(socksHost string, socksPort int, timeoutMs int, domain string, reqPath string, username, password string) (string, error) {
 	address := net.JoinHostPort(socksHost, strconv.Itoa(socksPort))
 	conn, err := net.DialTimeout("tcp", address, time.Duration(timeoutMs)*time.Millisecond)
 	if err != nil {
@@ -2073,8 +2098,14 @@ func fetchIPViaSocksTarget(socksHost string, socksPort int, timeoutMs int, domai
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(time.Duration(timeoutMs+1500) * time.Millisecond))
 
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		return "", err
+	if username != "" || password != "" {
+		if _, err := conn.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
+			return "", err
+		}
+	} else {
+		if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+			return "", err
+		}
 	}
 	hello := make([]byte, 2)
 	if _, err := io.ReadFull(conn, hello); err != nil {
@@ -2082,6 +2113,29 @@ func fetchIPViaSocksTarget(socksHost string, socksPort int, timeoutMs int, domai
 	}
 	if hello[0] != 0x05 || hello[1] == 0xff {
 		return "", fmt.Errorf("socks handshake failed")
+	}
+
+	if hello[1] == 0x02 {
+		uLen := len(username)
+		pLen := len(password)
+		if uLen > 255 || pLen > 255 {
+			return "", fmt.Errorf("username or password exceeds 255 bytes")
+		}
+		authReq := make([]byte, 0, 3+uLen+pLen)
+		authReq = append(authReq, 0x01, byte(uLen))
+		authReq = append(authReq, []byte(username)...)
+		authReq = append(authReq, byte(pLen))
+		authReq = append(authReq, []byte(password)...)
+		if _, err := conn.Write(authReq); err != nil {
+			return "", err
+		}
+		authResp := make([]byte, 2)
+		if _, err := io.ReadFull(conn, authResp); err != nil {
+			return "", err
+		}
+		if authResp[1] != 0x00 {
+			return "", fmt.Errorf("socks authentication failed")
+		}
 	}
 
 	domainBytes := []byte(domain)
@@ -2137,6 +2191,96 @@ func fetchIPViaSocksTarget(socksHost string, socksPort int, timeoutMs int, domai
 		text = text[idx+4:]
 	}
 	ip := strings.TrimSpace(strings.Split(text, "\n")[0])
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("invalid egress ip response: %q", ip)
+	}
+	return ip, nil
+}
+
+func fetchIPViaHTTP(proxyHost string, proxyPort int, source string, timeoutMs int, auth ...string) (string, error) {
+	var username, password string
+	if len(auth) > 0 {
+		username = auth[0]
+	}
+	if len(auth) > 1 {
+		password = auth[1]
+	}
+	targets := []struct {
+		id   string
+		host string
+		path string
+	}{
+		{id: "api.ipify.org", host: "api.ipify.org", path: "/?format=text"},
+		{id: "ipv4.icanhazip.com", host: "ipv4.icanhazip.com", path: "/"},
+		{id: "ifconfig.me", host: "ifconfig.me", path: "/ip"},
+		{id: "ip.sb", host: "api.ip.sb", path: "/ip"},
+	}
+	if source != "" {
+		filtered := targets[:0]
+		for _, t := range targets {
+			if strings.EqualFold(t.id, source) || strings.Contains(t.host, source) {
+				filtered = append(filtered, t)
+			}
+		}
+		targets = filtered
+		if len(targets) == 0 {
+			return "", fmt.Errorf("unknown source %q", source)
+		}
+	}
+
+	var lastErr error
+	for _, target := range targets {
+		ip, err := fetchIPViaHTTPTarget(proxyHost, proxyPort, timeoutMs, target.host, target.path, username, password)
+		if err == nil && strings.TrimSpace(ip) != "" {
+			return strings.TrimSpace(ip), nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("no egress ip endpoint available")
+}
+
+func fetchIPViaHTTPTarget(proxyHost string, proxyPort int, timeoutMs int, domain string, reqPath string, username, password string) (string, error) {
+	address := net.JoinHostPort(proxyHost, strconv.Itoa(proxyPort))
+	conn, err := net.DialTimeout("tcp", address, time.Duration(timeoutMs)*time.Millisecond)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(time.Duration(timeoutMs+1500) * time.Millisecond))
+
+	targetURL := fmt.Sprintf("http://%s%s", domain, reqPath)
+	reqStr := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: sub2socks5-go/0.1.0\r\nConnection: close\r\n", targetURL, domain)
+	if username != "" || password != "" {
+		creds := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
+		reqStr += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", creds)
+	}
+	reqStr += "\r\n"
+
+	if _, err := conn.Write([]byte(reqStr)); err != nil {
+		return "", err
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(io.LimitReader(conn, 64*1024)), nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusProxyAuthRequired {
+		return "", fmt.Errorf("proxy authentication failed (HTTP 407)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("proxy returned status %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if err != nil {
+		return "", err
+	}
+	ip := strings.TrimSpace(strings.Split(string(bodyBytes), "\n")[0])
 	if net.ParseIP(ip) == nil {
 		return "", fmt.Errorf("invalid egress ip response: %q", ip)
 	}

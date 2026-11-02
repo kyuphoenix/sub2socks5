@@ -1215,18 +1215,85 @@ textarea,
 }
 
 .socks-target-field {
-  grid-column: 1;
+  grid-column: auto;
 }
 
 .socks-remove-action {
-  grid-column: 2;
+  grid-column: 1 / -1;
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: flex-end;
 }
 
 .socks-remove-action button {
   white-space: nowrap;
+}
+
+.socks-auth-panel {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--inner-card-border);
+}
+
+.socks-auth-panel.is-hidden {
+  display: none;
+}
+
+.socks-auth-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.socks-auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.input-action-group {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+}
+
+.input-action-group input {
+  padding-right: 38px;
+}
+
+.input-suffix-button {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 6px;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: background 0.15s, color 0.15s, transform 0.2s;
+}
+
+.input-suffix-button svg,
+.input-suffix-button svg * {
+  pointer-events: none;
+  user-select: none;
+}
+
+.input-suffix-button:hover {
+  background: #e5e7eb;
+  color: var(--text-main);
+}
+
+.input-suffix-button:active {
+  transform: translateY(-50%) rotate(180deg);
 }
 
 .overlay-card {
@@ -1402,7 +1469,8 @@ textarea,
   .timeline .form-grid,
   .kv-grid,
   .node-pill-grid,
-  .socks-service-grid {
+  .socks-service-grid,
+  .socks-auth-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 

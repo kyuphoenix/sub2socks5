@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#f0f2f5" />
-  <title>SOCKS5 服务 - sub2socks5</title>
+  <title>SOCKS5 / HTTP 服务 - sub2socks5</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -12,7 +12,7 @@
     <div id="toast-container" class="toast-container" role="status" aria-live="polite"></div>
     <section>
       <div class="section-heading">
-        <h1>SOCKS5 服务 <span id="app-version" class="app-version-badge" title="当前版本"></span></h1>
+        <h1>SOCKS5 / HTTP 服务 <span id="app-version" class="app-version-badge" title="当前版本"></span></h1>
         <div class="section-heading-actions">
           <button id="back-home" type="button">返回主页</button>
           <button id="save-socks" type="button">保存配置</button>
@@ -25,7 +25,8 @@
       <div class="section-heading">
         <h2 class="service-list-title">服务列表 <span id="service-count-badge" class="editor-status compact-badge">0 个服务</span> <span id="unsaved-badge" class="editor-status compact-badge is-dirty" style="display:none">0 个服务未保存</span></h2>
         <div class="section-heading-actions">
-          <button id="clear-socks" type="button" class="danger-button">删除所有 SOCKS5 服务</button>
+          <button id="clear-socks" type="button" class="danger-button">删除所有服务</button>
+          <button id="add-http-socks" type="button" class="copy-service-button">+ 添加 HTTP 服务</button>
           <button id="add-socks" type="button">+ 添加 SOCKS5 服务</button>
         </div>
       </div>
@@ -35,7 +36,7 @@
 
   <div id="socks-test-overlay" class="overlay is-hidden" aria-hidden="true">
     <div class="overlay-card">
-      <h3>测试 SOCKS5 服务</h3>
+      <h3 id="socks-test-title">测试代理服务</h3>
       <div class="overlay-step" id="socks-test-step">选择测试 API</div>
       <label class="socks-test-target">
         <span>测试 API</span>
